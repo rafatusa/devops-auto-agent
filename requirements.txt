@@ -1,0 +1,6 @@
+anthropic
+python-telegram-bot
+PyGithub
+boto3
+python-dotenv
+requests
