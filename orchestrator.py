@@ -48,6 +48,8 @@ class Orchestrator:
         app:         str,
         repo_name:   str,
         region:      str = "us-east-1",
+        branch:      str = "main",
+        target:      str = "ec2",
         progress_cb: Optional[Callable] = None,
     ) -> dict:
         self.resume(user_id)
@@ -118,50 +120,47 @@ class Orchestrator:
                 f"  SSH keys:       {sk_status}"
             )
 
-            # ── Step 2: Files ─────────────────────────────────────────────────
-            await step("generate_files", "Checking existing repo files...")
-
-            repo_files = github_agent.get_existing_files(repo_name)
-
-            # Let code_agent plan what files are needed for this app
-            files_needed = code_agent.plan_files(project, app, region)
-            missing      = [f for f in files_needed if f not in repo_files]
-
-            if not missing:
-                await cb(f"Found {len(repo_files)} existing files in repo — using them")
-                for path, fcontent in repo_files.items():
-                    state.save_file(project, path, fcontent)
-                files = repo_files
-            else:
-                await cb(f"Missing {len(missing)} files — generating: {missing}")
-                all_new = code_agent.generate_files(project, app, region)
-                files   = {**repo_files, **{f: all_new[f] for f in missing if f in all_new}}
-                for path, fcontent in files.items():
-                    state.save_file(project, path, fcontent)
-
-            state.log_step(project, "generate_files", "done", result=f"{len(files)} files")
-            await cb(f"Ready with {len(files)} files")
-
-            # ── Step 3: GitHub Setup ──────────────────────────────────────────
+            # ── Step 2: GitHub Setup ──────────────────────────────────────────
             self._check_stop(user_id)
             await step("github_setup", f"Setting up GitHub repo {repo_name}...")
 
             repo_result = github_agent.create_repo(repo_name, f"DevOps Agent — {project}")
             await cb(f"Repo: {repo_result.get('url', repo_name)}")
 
-            # Push ONLY files missing from repo
-            files_to_push = {
-                path: fcontent
-                for path, fcontent in files.items()
-                if path not in repo_files
-            }
+            # Create branch from main FIRST — so branch inherits all existing files
+            if branch != "main":
+                br = github_agent.create_branch(repo_name, branch, "main")
+                await cb(f"Branch '{branch}' {br.get('status', 'ready')} (from main)")
+
+            # ── Step 3: Files ─────────────────────────────────────────────────
+            await step("generate_files", f"Reading files from branch '{branch}'...")
+
+            # Read ALL existing files from the branch
+            # (if branch was just created from main, it already has all main files)
+            repo_files = github_agent.get_existing_files(repo_name, branch=branch)
+            await cb(f"Found {len(repo_files)} files in branch '{branch}'")
+
+            # Context-aware generation:
+            # Pass existing files so code_agent can see what's there
+            # and only generate what actually needs to change for this app
+            await cb(f"Analysing what needs to change for '{app}' on {target}...")
+            files_to_push = code_agent.generate_files(
+                project, app, region,
+                existing_files=repo_files,
+                target=target,
+            )
+
+            state.log_step(project, "generate_files", "done",
+                           result=f"{len(files_to_push)} files to push")
+
             if files_to_push:
-                push_result = github_agent.push_files(repo_name, files_to_push)
+                await cb(f"Pushing {len(files_to_push)} changed files: {list(files_to_push.keys())}")
+                push_result = github_agent.push_files(repo_name, files_to_push, branch=branch)
                 if push_result.get("failed"):
-                    await cb(f"Warning: failed to push some files")
-                await cb(f"Pushed {len(push_result.get('pushed', []))} missing files")
+                    await cb(f"Warning: failed to push: {push_result['failed']}")
+                await cb(f"Pushed {len(push_result.get('pushed', []))} files to '{branch}'")
             else:
-                await cb("All files already in repo — nothing to push")
+                await cb(f"No changes needed — branch '{branch}' is already up to date")
 
             # Set secrets
             secrets = {
@@ -185,8 +184,8 @@ class Orchestrator:
                 await cb(f"Cancelled {len(cancelled['cancelled'])} running pipeline(s)")
                 await asyncio.sleep(5)
 
-            await cb("Triggering pipeline...")
-            trigger_result = github_agent.trigger_pipeline(repo_name, "deploy.yml")
+            await cb(f"Triggering pipeline on branch '{branch}'...")
+            trigger_result = github_agent.trigger_pipeline(repo_name, "deploy.yml", branch)
             if trigger_result.get("status") == "error":
                 raise Exception(f"Trigger failed: {trigger_result['error']}")
             await cb(f"Pipeline triggered: {trigger_result.get('url')}")
@@ -202,7 +201,7 @@ class Orchestrator:
                 # Only poll on first iteration — retrigger handles subsequent ones
                 if retry > 0:
                     await cb(f"Retriggering pipeline (attempt {retry}/{MAX_RETRIES})...")
-                    trigger2 = github_agent.trigger_pipeline(repo_name, "deploy.yml")
+                    trigger2 = github_agent.trigger_pipeline(repo_name, "deploy.yml", branch)
                     if trigger2.get("status") == "error":
                         last_error = trigger2["error"]
                         await cb(f"Retrigger failed: {last_error}")
@@ -213,6 +212,7 @@ class Orchestrator:
                 pipeline = await github_agent.poll_pipeline(
                     repo_name,
                     interval=30,
+                    branch=branch,
                     stop_flag=lambda: self.is_stopped(user_id),
                     progress_cb=cb,
                 )
@@ -226,12 +226,21 @@ class Orchestrator:
                     return {"status": "timeout", "message": "Pipeline timed out"}
 
                 if pipeline.get("conclusion") == "success":
-                    ip = self._extract_ip(pipeline)
-                    if not ip and ec2.get("exists"):
-                        ip = ec2["ip"]
+                    if target == "ecs":
+                        # ECS uses ALB DNS name from terraform output
+                        url = self._extract_url(pipeline) or ""
+                        ip  = url.replace("http://", "")
+                    else:
+                        ip  = self._extract_ip(pipeline)
+                        if not ip and ec2.get("exists"):
+                            ip = ec2.get("ip", "")
+                        if not ip:
+                            fresh_ec2 = aws_agent.check_resources(project, region)
+                            ip = fresh_ec2.get("ip", "")
+                        url = f"http://{ip}" if ip else ""
                     state.update_deployment(project, status="deployed", ec2_ip=ip)
                     state.log_step(project, "pipeline", "done", result=ip)
-                    return {"status": "success", "ip": ip, "url": f"http://{ip}", "project": project}
+                    return {"status": "success", "ip": ip, "url": url, "project": project}
 
                 # Pipeline failed
                 if retry >= MAX_RETRIES:
@@ -274,6 +283,7 @@ class Orchestrator:
                     fix_result["file"],
                     fix_result["fixed_content"],
                     f"Auto-fix attempt {retry}: {fix_result['file']}",
+                    branch=branch,
                 )
                 if push.get("failed"):
                     last_error = str(push["failed"])
@@ -509,12 +519,40 @@ class Orchestrator:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _extract_ip(self, pipeline: dict) -> str:
+    def _extract_url(self, pipeline: dict) -> str:
+        """Extract ALB URL from ECS pipeline logs."""
         import re
         for job in pipeline.get("all_jobs", []):
-            match = re.search(r"Live at http://(\d+\.\d+\.\d+\.\d+)", job.get("log", ""))
-            if match:
-                return match.group(1)
+            log = job.get("log", "")
+            for pattern in [
+                r"alb_url\s*=\s*(https?://[\w.-]+)",
+                r"Live URL:\s*(https?://[\w.-]+)",
+                r"http://([\w.-]+-\d+\.[\w.-]+\.elb\.amazonaws\.com)",
+            ]:
+                match = re.search(pattern, log)
+                if match:
+                    val = match.group(1)
+                    return val if val.startswith("http") else f"http://{val}"
+        return ""
+
+    def _extract_ip(self, pipeline: dict) -> str:
+        import re
+        ip_pattern = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
+        for job in pipeline.get("all_jobs", []):
+            log = job.get("log", "")
+            # Try all common patterns in pipeline logs
+            for pattern in [
+                r"Live URL:\s*http://(\d+\.\d+\.\d+\.\d+)",
+                r"Live at http://(\d+\.\d+\.\d+\.\d+)",
+                r"Server IP:\s*(\d+\.\d+\.\d+\.\d+)",
+                r"server_ip=(\d+\.\d+\.\d+\.\d+)",
+                r"ip=(\d+\.\d+\.\d+\.\d+)",
+                r"public_ip=(\d+\.\d+\.\d+\.\d+)",
+                r"http://(\d+\.\d+\.\d+\.\d+)",
+            ]:
+                match = re.search(pattern, log)
+                if match:
+                    return match.group(1)
         return ""
 
 

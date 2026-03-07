@@ -1,13 +1,12 @@
 """
 Code Agent — ONLY agent that uses AI (Claude)
-- Generates files using skills as context
+- Context-aware: reads existing files before generating/updating
+- Generates only what needs to change, not the whole repo
 - Fixes specific files given errors
-- Usable standalone or via orchestrator
 """
 import os
 import logging
 import anthropic
-from pathlib import Path
 
 import state
 from skills import load_skill, load_skills
@@ -36,416 +35,371 @@ class CodeAgent:
 
     # ── Plan files ────────────────────────────────────────────────────────────
 
-    def plan_files(self, project: str, app: str, region: str = "us-east-1") -> list:
+    def plan_files(self, project: str, app: str, region: str = "us-east-1",
+                   target: str = "ec2") -> list:
         """
-        AI decides what files are needed for this app.
-        Returns list of file paths to generate.
+        target: "ec2" | "ec2-docker" | "ecs"
+        Returns list of files needed.
         """
+        if target == "ecs":
+            files = [
+                "terraform/main.tf",
+                "Dockerfile",
+                ".github/workflows/deploy.yml",
+                ".github/workflows/destroy.yml",
+            ]
+            if any(w in app.lower() for w in ["nginx","apache","web","html","static"]):
+                files.append("html/index.html")
+            return files
+
+        elif target == "ec2-docker":
+            files = [
+                "terraform/main.tf",
+                "ansible/playbook.yml",
+                "Dockerfile",
+                ".github/workflows/deploy.yml",
+                ".github/workflows/destroy.yml",
+            ]
+            if any(w in app.lower() for w in ["nginx","apache","web","html","static"]):
+                files.append("html/index.html")
+            return files
+
+        else:  # ec2 direct
+            files = [
+                "terraform/main.tf",
+                "ansible/playbook.yml",
+                ".github/workflows/deploy.yml",
+                ".github/workflows/destroy.yml",
+            ]
+            if any(w in app.lower() for w in ["nginx","apache","web","html","static"]):
+                files.append("html/index.html")
+            return files
+
+    # ── Context-aware change planning ─────────────────────────────────────────
+
+    def plan_changes(self, project: str, app: str, region: str,
+                     existing_files: dict) -> dict:
+        """
+        Given existing repo files + new app requirement,
+        AI decides: what to KEEP, UPDATE, or CREATE.
+        Returns {"keep": [...], "update": [...], "create": [...]}
+        """
+        if not existing_files:
+            return {"keep": [], "update": [], "create": self.plan_files(project, app, region)}
+
+        file_summary = "\n".join(
+            f"- {path} ({len(content)} chars)"
+            for path, content in existing_files.items()
+        )
+
         prompt = (
-            f"You are a DevOps agent. List the exact files needed to deploy '{app}' on AWS EC2 "
-            f"using Terraform and Ansible via GitHub Actions pipeline.\n\n"
+            f"The repo already has files. We need to deploy a NEW app type.\n\n"
             f"Project: {project}\n"
-            f"App: {app}\n"
+            f"New app: {app}\n"
             f"Region: {region}\n\n"
+            f"EXISTING FILES:\n{file_summary}\n\n"
+            f"Decide what to do with each file for '{app}':\n\n"
             f"Rules:\n"
-            f"- Always include: terraform/main.tf, ansible/playbook.yml, "
-            f".github/workflows/deploy.yml, .github/workflows/destroy.yml\n"
-            f"- Add html/index.html only for web servers (nginx, apache)\n"
-            f"- Add app/ files only if app code is needed (node, python, spring-boot, react)\n"
-            f"- List each file on its own line as: FILE: path/to/file\n"
-            f"- No explanation, just the FILE: lines"
+            f"- terraform/main.tf — KEEP (infrastructure is the same)\n"
+            f"- deploy.yml / destroy.yml — KEEP (pipeline structure is the same)\n"
+            f"- ansible/playbook.yml — UPDATE if app type changes how server is configured\n"
+            f"- html/index.html — KEEP unless new app has no web UI\n"
+            f"- Dockerfile — CREATE if app uses docker and it doesn't exist yet\n"
+            f"- Any other missing file the new app needs — CREATE\n\n"
+            f"Respond ONLY in this format:\n"
+            f"KEEP: path\n"
+            f"UPDATE: path\n"
+            f"CREATE: path"
         )
-        response = _ask(prompt)
-        files_needed = []
-        for line in response.splitlines():
-            if line.startswith("FILE:"):
-                path = line.replace("FILE:", "").strip()
-                files_needed.append(path)
 
-        # Always ensure core files are included
-        core = [
-            "terraform/main.tf",
-            "ansible/playbook.yml",
-            ".github/workflows/deploy.yml",
-            ".github/workflows/destroy.yml",
-        ]
-        for f in core:
-            if f not in files_needed:
-                files_needed.append(f)
+        result = {"keep": [], "update": [], "create": []}
+        for line in _ask(prompt).splitlines():
+            line = line.strip()
+            if line.startswith("KEEP:"):
+                result["keep"].append(line.replace("KEEP:", "").strip())
+            elif line.startswith("UPDATE:"):
+                result["update"].append(line.replace("UPDATE:", "").strip())
+            elif line.startswith("CREATE:"):
+                result["create"].append(line.replace("CREATE:", "").strip())
 
-        # Force html for web servers — don't rely on AI to decide
-        web_apps = ["nginx", "apache", "httpd", "web", "html", "static"]
-        if any(w in app.lower() for w in web_apps):
-            if "html/index.html" not in files_needed:
-                files_needed.append("html/index.html")
+        logger.info(f"Change plan — keep:{len(result['keep'])} "
+                    f"update:{len(result['update'])} create:{len(result['create'])}")
+        return result
 
-        logger.info(f"Planned files for {project} ({app}): {files_needed}")
-        return files_needed
+    # ── Generate files — context-aware ───────────────────────────────────────
 
-    # ── Generate all files ────────────────────────────────────────────────────
-
-    def generate_files(self, project: str, app: str, region: str = "us-east-1") -> dict:
+    def generate_files(self, project: str, app: str, region: str = "us-east-1",
+                       existing_files: dict = None, target: str = "ec2") -> dict:
         """
-        AI plans what files are needed, then generates each one.
-        Returns {path: content}
+        Context-aware generation based on target.
+        target: "ec2" | "ec2-docker" | "ecs"
+        Returns {path: content} — ONLY files that need to be pushed.
         """
-        files_needed = self.plan_files(project, app, region)
-        files = {}
-
-        for path in files_needed:
-            if path == "terraform/main.tf":
-                files[path] = self.gen_terraform(project, region)
-            elif path == "ansible/playbook.yml":
-                files[path] = self.gen_ansible(project, app)
-            elif path == "html/index.html":
-                files[path] = self.gen_html(project, app)
-            elif path == ".github/workflows/deploy.yml":
-                files[path] = self.gen_pipeline(project, region, "deploy")
-            elif path == ".github/workflows/destroy.yml":
-                files[path] = self.gen_pipeline(project, region, "destroy")
-            else:
-                # Generate any other file using AI
-                files[path] = self._gen_custom_file(project, app, path)
-
-        for path, content in files.items():
-            state.save_file(project, path, content)
-
-        logger.info(f"Generated {len(files)} files for {project}")
-        return files
-
-    def _gen_custom_file(self, project: str, app: str, path: str) -> str:
-        """Generate any file not covered by standard generators."""
-        prompt = (
-            f"Generate the file '{path}' for deploying {app} on AWS EC2.\n"
-            f"Project: {project}\n"
-            f"Return ONLY the file content, no explanation, no markdown fences."
-        )
-        return _strip_fences(_ask(prompt))
-
-    # ── Individual generators ─────────────────────────────────────────────────
-
-    def gen_terraform(self, project: str, region: str = "us-east-1") -> str:
-        """Generate terraform/main.tf using terraform-aws skill."""
-        skill = load_skills("terraform-aws")
-        prompt = f"""Generate a complete Terraform main.tf for project "{project}" in region "{region}".
-
-Follow ALL rules and patterns from the skills below exactly.
-Return ONLY the terraform HCL code, no explanation, no markdown fences.
-
-{skill}"""
-        content = _ask(prompt)
-        content = _strip_fences(content)
-        if project:
-            state.save_file(project, "terraform/main.tf", content)
-        return content
-
-    def gen_ansible(self, project: str, app: str) -> str:
-        """Generate ansible/playbook.yml using app-specific skill."""
-        app_skill  = load_skills(app.lower().replace(" ", "-").replace(".", ""))
-        base_skill = load_skill("ansible")
-
-        prompt = f"""Generate a complete Ansible playbook for deploying {app} on Ubuntu 22.04.
-
-Project: {project}
-App: {app}
-
-Follow ALL rules and patterns from the skills below.
-Return ONLY the YAML content, no explanation, no markdown fences.
-
-{base_skill}
-
-{app_skill}"""
-        content = _ask(prompt)
-        content = _strip_fences(content)
-        if project:
-            state.save_file(project, "ansible/playbook.yml", content)
-        return content
-
-    def gen_html(self, project: str, app: str = "") -> str:
-        """Generate a clean HTML page."""
-        skill = load_skill("html") or ""
-        prompt = f"""Generate a clean, modern HTML page for project "{project}".
-Dark theme, minimal design, show project name prominently.
-{f'Additional guidance: {skill}' if skill else ''}
-Return ONLY the HTML, no explanation."""
-        content = _ask(prompt)
-        content = _strip_fences(content)
-        if project:
-            state.save_file(project, "html/index.html", content)
-        return content
-
-    def gen_pipeline(self, project: str, region: str = "us-east-1", pipeline_type: str = "deploy") -> str:
-        """Generate GitHub Actions pipeline using pipeline skill."""
-        skill = load_skills("pipeline", "terraform-aws", "ansible")
-
-        if pipeline_type == "destroy":
-            prompt = f"""Generate a GitHub Actions destroy.yml workflow for project "{project}".
-
-Requirements:
-- Run terraform destroy with S3 backend in region {region}
-- S3 state bucket: devops-agent-tfstate, key: {project}/terraform.tfstate
-- Pass ALL required variables: public_key, project_name, aws_region
-- Use: -var="public_key=placeholder" -var="project_name=${{{{ secrets.PROJECT_NAME }}}}" -var="aws_region=${{{{ secrets.AWS_REGION }}}}"
-- Add || true after destroy so pipeline doesn't fail on already-deleted resources
-- Use secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, SSH_PUBLIC_KEY, PROJECT_NAME
-
-Return ONLY the YAML, no explanation, no markdown fences."""
+        if existing_files is not None:
+            plan = self.plan_changes(project, app, region, existing_files, target)
+            to_generate = plan["update"] + plan["create"]
         else:
-            prompt = f"""Generate a complete GitHub Actions deploy.yml workflow for project "{project}" in region "{region}".
+            to_generate    = self.plan_files(project, app, region, target)
+            existing_files = {}
 
-Jobs: provision → configure → verify → notify
-Follow ALL rules and patterns from the skills below exactly.
-Return ONLY the YAML content, no explanation, no markdown fences.
+        if not to_generate:
+            logger.info("Nothing to generate — all files up to date")
+            return {}
 
-{skill}"""
+        # Build context from existing files so Claude can read them
+        context = self._build_context(existing_files)
 
-        content = _ask(prompt)
-        content = _strip_fences(content)
-        path = f".github/workflows/{pipeline_type}.yml"
-        if project:
-            state.save_file(project, path, content)
-        return content
+        generated = {}
+        for path in to_generate:
+            logger.info(f"Generating: {path} (target={target})")
+            content = self._generate_one(project, app, region, path,
+                                          context, existing_files, target)
+            if content:
+                generated[path] = content
+                state.save_file(project, path, content)
 
-    # ── Fix file ──────────────────────────────────────────────────────────────
+        return generated
 
-    def analyze_and_fix(self, project: str, log_context: str, all_files: dict = None) -> dict:
-        """
-        Dynamic fix — AI reads the log, identifies the broken file,
-        and fixes it. No hardcoded patterns.
-        Returns {file, fixed_content, diff_summary, error_summary}
-        """
-        if all_files is None:
-            all_files = state.get_all_files(project)
+    def _build_context(self, existing_files: dict, plan: dict = None) -> str:
+        """Build context string — existing files + deployment plan reasoning."""
+        parts = []
+        if plan and plan.get("reasoning"):
+            parts.append(f"DEPLOYMENT DECISION: {plan['reasoning']}\n")
+        if existing_files:
+            parts.append("EXISTING FILES IN REPO:")
+            for path, file_content in existing_files.items():
+                # Show full content for app-specific files
+                if any(k in path for k in ["ansible", "Dockerfile", "app/", "src/"]):
+                    parts.append(f"--- {path} ---\n{file_content}\n")
+                else:
+                    parts.append(f"--- {path} --- (exists, {len(file_content)} chars)")
+        return "\n".join(parts)
 
-        if not all_files:
-            return {"error": "No local files found for project"}
+    def _generate_one(self, project: str, app: str, region: str,
+                      path: str, context: str, existing_files: dict,
+                      target: str = "ec2") -> str:
+        """Generate or update a single file with full context + target awareness."""
+        existing = existing_files.get(path, "")
+        action   = "UPDATE" if existing else "CREATE"
 
-        file_listing = "\n".join(f"- {path}" for path in all_files.keys())
+        target_desc = {
+            "ec2":        "directly on EC2 (no Docker) using Ansible",
+            "ec2-docker": "in a Docker container on EC2 (Ansible installs Docker, builds image, runs container)",
+            "ecs":        "on Amazon ECS Fargate (no EC2, no Ansible, ECR + ECS + ALB)",
+        }.get(target, "on EC2")
 
-        identify_prompt = f"""A deployment pipeline failed. Read the error log and identify:
-1. Which file caused the error (exact path from the list)
-2. What specific lines need to change and why
+        if "destroy.yml" in path:
+            return self._gen_destroy(project, region, target)
 
-Available files:
-{file_listing}
-
-ERROR LOG:
-{log_context[-3000:]}
-
-Respond in this exact format:
-FILE: <exact file path from the list above>
-ERROR: <exactly what is wrong and what minimal change fixes it>"""
-
-        identification = _ask(identify_prompt)
-
-        file_path  = None
-        error_desc = None
-        for line in identification.splitlines():
-            if line.startswith("FILE:"):
-                file_path = line.replace("FILE:", "").strip()
-            if line.startswith("ERROR:"):
-                error_desc = line.replace("ERROR:", "").strip()
-
-        # Validate file exists — try partial match if needed
-        if not file_path or file_path not in all_files:
-            matched = False
-            for f in all_files:
-                if file_path and (file_path in f or f in str(file_path)):
-                    file_path = f
-                    matched = True
-                    break
-
-            if not matched:
-                # File doesn't exist at all — create it
-                logger.info(f"File {file_path} missing — will create it")
-                return self._create_missing_file(project, file_path, error_desc or log_context)
-
-        return self.fix_file(project, file_path, error_desc or "Fix the error shown in the log", log_context)
-
-    def _create_missing_file(self, project: str, file_path: str, error_context: str) -> dict:
-        """Create a file that is missing entirely."""
-        dep = state.get_deployment(project) or {}
-        app = dep.get("app", "nginx")
-
-        prompt = (
-            f"A deployment failed because the file '{file_path}' is missing.\n"
-            f"Project: {project}\n"
-            f"App: {app}\n"
-            f"Error context: {error_context[:500]}\n\n"
-            f"Generate the complete content for '{file_path}'.\n"
-            f"Return ONLY the file content, no explanation, no markdown fences."
-        )
-        created = _strip_fences(_ask(prompt))
-        state.save_file(project, file_path, created)
-
-        return {
-            "file":          file_path,
-            "fixed_content": created,
-            "diff_summary":  f"Created missing file: {file_path}",
-            "error_summary": f"Missing file {file_path} — created",
-        }
-
-    def fix_file(self, project: str, file_path: str, error: str, log_context: str = "") -> dict:
-        """Fix a specific file — minimal change only."""
-        current = state.get_file(project, file_path)
-        if not current:
-            return {"error": f"File not found locally: {file_path}"}
-
-        # Load relevant skill
-        if "terraform" in file_path:
-            skill = load_skill("terraform-aws")
-        elif "ansible" in file_path or "playbook" in file_path:
-            skill = load_skill("ansible")
-        elif "workflow" in file_path or ".github" in file_path:
-            skill = load_skill("pipeline")
+        # Load target-specific skills
+        if "terraform" in path:
+            skill = load_skills("ecs") if target == "ecs" else load_skills("terraform-aws")
+        elif "ansible" in path or "playbook" in path:
+            skill = load_skills("docker", "ansible") if target == "ec2-docker" else load_skills("ansible")
+        elif ".github" in path:
+            skill = load_skills("ecs") if target == "ecs" else load_skills("pipeline", "terraform-aws", "ansible")
+        elif "Dockerfile" in path:
+            skill = load_skill("docker") or ""
         else:
             skill = ""
 
         prompt = (
-            f"You are fixing a deployment file. Make ONLY the minimal change needed.\n\n"
-            f"FILE: {file_path}\n"
-            f"ERROR: {error}\n\n"
-            f"LOG CONTEXT:\n{log_context[-1500:] if log_context else 'none'}\n\n"
-            f"{'SKILL REFERENCE:\n' + skill + chr(10) if skill else ''}"
-            f"CURRENT FILE:\n{current}\n\n"
-            f"Instructions:\n"
-            f"- Find ONLY the lines causing the error\n"
-            f"- Change ONLY those lines, do not touch anything else\n"
-            f"- Do NOT rewrite or reformat the whole file\n"
-            f"- Do NOT change variable names or logic unrelated to the error\n"
-            f"- Return the COMPLETE file with ONLY the broken lines fixed\n"
-            f"- No markdown fences, no explanation"
+            f"{action} the file '{path}' to deploy '{app}' {target_desc}.\n\n"
+            f"Project: {project} | App: {app} | Region: {region} | Target: {target}\n\n"
+            + (f"{context}\n\n" if context else "")
+            + (f"CURRENT {path}:\n{existing}\n\n" if existing else "")
+            + (f"SKILL REFERENCE:\n{skill}\n\n" if skill else "")
+            + "CRITICAL INSTRUCTIONS:\n"
+            + _target_instructions(target, path)
+            + "\n- Return ONLY the file content, no explanation, no markdown fences"
         )
 
-        fixed = _ask(prompt)
-        fixed = _strip_fences(fixed)
+        return _strip_fences(_ask(prompt))
 
+    def _gen_destroy(self, project: str, region: str) -> str:
+        prompt = (
+            f"Generate a GitHub Actions destroy.yml for project \"{project}\".\n"
+            f"- Terraform destroy with S3 backend in region {region}\n"
+            f"- S3 bucket: devops-agent-tfstate, key: {project}/terraform.tfstate\n"
+            f"- Vars: -var=\"public_key=placeholder\" "
+            f"-var=\"project_name=${{{{ secrets.PROJECT_NAME }}}}\" "
+            f"-var=\"aws_region=${{{{ secrets.AWS_REGION }}}}\"\n"
+            f"- Add || true after destroy\n"
+            f"- Secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, "
+            f"SSH_PUBLIC_KEY, PROJECT_NAME\n"
+            f"Return ONLY the YAML, no explanation, no markdown fences."
+        )
+        return _strip_fences(_ask(prompt))
+
+    # ── Individual generators (kept for direct use) ───────────────────────────
+
+    def gen_terraform(self, project: str, region: str = "us-east-1") -> str:
+        skill   = load_skills("terraform-aws")
+        content = _strip_fences(_ask(
+            f"Generate terraform/main.tf for project \"{project}\" in \"{region}\".\n"
+            f"Follow ALL rules below.\nReturn ONLY HCL, no fences.\n\n{skill}"
+        ))
+        if project: state.save_file(project, "terraform/main.tf", content)
+        return content
+
+    def gen_ansible(self, project: str, app: str, existing: str = "") -> str:
+        skill = load_skills(app.lower().replace(" ", "-"), "ansible")
+        prompt = (
+            f"Generate ansible/playbook.yml for deploying {app} on Ubuntu 22.04.\n"
+            f"Project: {project}\n\n"
+            + (f"EXISTING PLAYBOOK (update this):\n{existing}\n\n" if existing else "")
+            + f"Follow ALL skill rules below.\nReturn ONLY YAML, no fences.\n\n{skill}"
+        )
+        content = _strip_fences(_ask(prompt))
+        if project: state.save_file(project, "ansible/playbook.yml", content)
+        return content
+
+    def gen_html(self, project: str, app: str = "") -> str:
+        content = _strip_fences(_ask(
+            f"Generate a clean dark-theme HTML page for project \"{project}\".\n"
+            f"Return ONLY HTML, no explanation."
+        ))
+        if project: state.save_file(project, "html/index.html", content)
+        return content
+
+    def gen_pipeline(self, project: str, region: str = "us-east-1",
+                     pipeline_type: str = "deploy") -> str:
+        if pipeline_type == "destroy":
+            return self._gen_destroy(project, region)
+        skill   = load_skills("pipeline", "terraform-aws", "ansible")
+        content = _strip_fences(_ask(
+            f"Generate deploy.yml for project \"{project}\" in \"{region}\".\n"
+            f"Jobs: provision→configure→verify→notify\n"
+            f"Follow ALL rules below.\nReturn ONLY YAML, no fences.\n\n{skill}"
+        ))
+        if project: state.save_file(project, ".github/workflows/deploy.yml", content)
+        return content
+
+    # ── Fix file ──────────────────────────────────────────────────────────────
+
+    def analyze_and_fix(self, project: str, log_context: str,
+                        all_files: dict = None) -> dict:
+        if all_files is None:
+            all_files = state.get_all_files(project)
+        if not all_files:
+            return {"error": "No local files found"}
+
+        file_listing = "\n".join(f"- {p}" for p in all_files)
+        resp = _ask(
+            f"Pipeline failed. Which file caused this error and what needs to change?\n\n"
+            f"Files:\n{file_listing}\n\n"
+            f"LOG:\n{log_context[-3000:]}\n\n"
+            f"Respond:\nFILE: <path>\nERROR: <what to fix>"
+        )
+
+        file_path = error_desc = None
+        for line in resp.splitlines():
+            if line.startswith("FILE:"):  file_path  = line.replace("FILE:", "").strip()
+            if line.startswith("ERROR:"): error_desc = line.replace("ERROR:", "").strip()
+
+        if not file_path or file_path not in all_files:
+            for f in all_files:
+                if file_path and (file_path in f or f in str(file_path)):
+                    file_path = f; break
+            else:
+                return self._create_missing(project, file_path, error_desc or log_context)
+
+        return self.fix_file(project, file_path,
+                             error_desc or "Fix error from log", log_context)
+
+    def _create_missing(self, project: str, path: str, ctx: str) -> dict:
+        dep = state.get_deployment(project) or {}
+        app = dep.get("app", "nginx")
+        created = _strip_fences(_ask(
+            f"Create missing file '{path}' for {app} on AWS EC2.\n"
+            f"Project: {project}\nContext: {ctx[:500]}\n"
+            f"Return ONLY file content, no fences."
+        ))
+        state.save_file(project, path, created)
+        return {"file": path, "fixed_content": created,
+                "diff_summary": f"Created: {path}", "error_summary": f"Missing: {path}"}
+
+    def fix_file(self, project: str, file_path: str, error: str,
+                 log_context: str = "") -> dict:
+        current = state.get_file(project, file_path)
+        if not current:
+            return {"error": f"File not found: {file_path}"}
+
+        if "terraform" in file_path:   skill = load_skill("terraform-aws")
+        elif "ansible" in file_path:   skill = load_skill("ansible")
+        elif ".github" in file_path:   skill = load_skill("pipeline")
+        else:                           skill = ""
+
+        fixed = _strip_fences(_ask(
+            f"Fix ONLY the broken lines in this file. Minimal change only.\n\n"
+            f"FILE: {file_path}\nERROR: {error}\n"
+            f"LOG:\n{log_context[-1500:]}\n\n"
+            + (f"SKILL:\n{skill}\n\n" if skill else "")
+            + f"CURRENT FILE:\n{current}\n\n"
+            f"Return COMPLETE file with ONLY broken lines fixed. No fences."
+        ))
         diff = _simple_diff(current, fixed)
         state.save_file(project, file_path, fixed)
-
-        return {
-            "file":          file_path,
-            "fixed_content": fixed,
-            "diff_summary":  diff,
-            "error_summary": error,
-        }
-
-    # ── Update file from instruction ──────────────────────────────────────────
+        return {"file": file_path, "fixed_content": fixed,
+                "diff_summary": diff, "error_summary": error}
 
     def update_file(self, project: str, file_path: str, instruction: str) -> dict:
-        """Update a file based on natural language instruction."""
         current = state.get_file(project, file_path) or ""
-
-        if current:
-            prompt = f"""Update this file based on the instruction.
-Return ONLY the complete updated file, no explanation, no markdown fences.
-
-FILE: {file_path}
-INSTRUCTION: {instruction}
-
-CURRENT:
-{current}"""
-        else:
-            prompt = f"""Create this file based on the instruction.
-Return ONLY the complete file content, no explanation, no markdown fences.
-
-FILE: {file_path}
-INSTRUCTION: {instruction}"""
-
-        updated = _ask(prompt)
-        updated = _strip_fences(updated)
-        diff    = _simple_diff(current, updated)
+        updated = _strip_fences(_ask(
+            f"{'Update' if current else 'Create'} file '{file_path}'.\n"
+            f"INSTRUCTION: {instruction}\n\n"
+            + (f"CURRENT:\n{current}\n\n" if current else "")
+            + "Return ONLY complete file, no fences."
+        ))
+        diff = _simple_diff(current, updated)
         state.save_file(project, file_path, updated)
-
-        return {
-            "file":         file_path,
-            "content":      updated,
-            "diff_summary": diff,
-        }
-
-    # ── Standalone / direct use ───────────────────────────────────────────────
+        return {"file": file_path, "content": updated, "diff_summary": diff}
 
     def ask(self, question: str) -> str:
-        """Ask code agent anything."""
-        system = (
-            "You are a DevOps code expert. "
-            "When generating code, return clean code without markdown fences unless asked. "
+        return _ask(question, system=(
+            "You are a DevOps expert. Return clean code without markdown fences. "
             "Be concise and practical."
-        )
-        return _ask(question, system=system)
+        ))
 
     def handle(self, action: str, args: dict) -> dict:
-        """
-        Flexible standalone handler.
-        Actions: generate, gen_terraform, gen_ansible, gen_pipeline,
-                 gen_html, fix, update, ask, list_skills, add_skill, delete_skill
-        """
         from skills import list_skills, add_skill as _add_skill, delete_skill
-
         try:
             if action == "generate":
                 files = self.generate_files(
-                    project=args["project"],
-                    app=args["app"],
+                    project=args["project"], app=args["app"],
                     region=args.get("region", "us-east-1"),
+                    existing_files=args.get("existing_files"),
+                    target=args.get("target", "ec2"),
                 )
                 return {"status": "ok", "files": list(files.keys()), "content": files}
-
             elif action == "gen_terraform":
-                content = self.gen_terraform(args.get("project", ""), args.get("region", "us-east-1"))
-                return {"status": "ok", "file": "terraform/main.tf", "content": content}
-
+                return {"status": "ok", "content": self.gen_terraform(
+                    args.get("project",""), args.get("region","us-east-1"))}
             elif action == "gen_ansible":
-                content = self.gen_ansible(args.get("project", ""), args.get("app", "nginx"))
-                return {"status": "ok", "file": "ansible/playbook.yml", "content": content}
-
+                return {"status": "ok", "content": self.gen_ansible(
+                    args.get("project",""), args.get("app","nginx"), args.get("existing",""))}
             elif action == "gen_html":
-                content = self.gen_html(args.get("project", ""), args.get("app", ""))
-                return {"status": "ok", "file": "html/index.html", "content": content}
-
+                return {"status": "ok", "content": self.gen_html(
+                    args.get("project",""), args.get("app",""))}
             elif action == "gen_pipeline":
-                content = self.gen_pipeline(
-                    args.get("project", ""),
-                    args.get("region", "us-east-1"),
-                    args.get("type", "deploy"),
-                )
-                return {"status": "ok", "file": f".github/workflows/{args.get('type','deploy')}.yml", "content": content}
-
+                return {"status": "ok", "content": self.gen_pipeline(
+                    args.get("project",""), args.get("region","us-east-1"), args.get("type","deploy"))}
             elif action == "fix":
-                result = self.fix_file(
-                    project=args["project"],
-                    file_path=args["file"],
-                    error=args.get("error", ""),
-                    log_context=args.get("log", ""),
-                )
-                return {"status": "ok", **result}
-
+                return {"status": "ok", **self.fix_file(
+                    args["project"], args["file"], args.get("error",""), args.get("log",""))}
             elif action == "update":
-                result = self.update_file(
-                    project=args.get("project", ""),
-                    file_path=args["file"],
-                    instruction=args["instruction"],
-                )
-                return {"status": "ok", **result}
-
+                return {"status": "ok", **self.update_file(
+                    args.get("project",""), args["file"], args["instruction"])}
             elif action == "ask":
-                response = self.ask(args["question"])
-                return {"status": "ok", "response": response}
-
+                return {"status": "ok", "response": self.ask(args["question"])}
             elif action == "list_skills":
                 return {"status": "ok", "skills": list_skills()}
-
             elif action == "add_skill":
-                path = _add_skill(args["name"], args["content"])
-                return {"status": "ok", "path": path}
-
+                return {"status": "ok", "path": _add_skill(args["name"], args["content"])}
             elif action == "delete_skill":
-                ok = delete_skill(args["name"])
-                return {"status": "ok" if ok else "not_found"}
-
+                return {"status": "ok" if delete_skill(args["name"]) else "not_found"}
             else:
                 return {"status": "error", "error": f"Unknown action: {action}"}
-
         except Exception as e:
             logger.error(f"CodeAgent error: {e}", exc_info=True)
             return {"status": "error", "error": str(e)}
@@ -453,29 +407,58 @@ INSTRUCTION: {instruction}"""
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _target_instructions(target: str, path: str) -> str:
+    """Return critical instructions based on deployment target and file."""
+    if target == "ec2-docker" and ("ansible" in path or "playbook" in path):
+        return (
+            "- DO NOT install nginx or any app directly on the host\n"
+            "- DO install Docker CE (not docker.io)\n"
+            "- Copy all project files to /opt/app/ on the server\n"
+            "- Build Docker image from /opt/app/\n"
+            "- Run container with: docker run -d --name app -p 80:80 --restart always app:latest\n"
+            "- Use '|| true' on docker stop/rm so they don't fail if container doesn't exist\n"
+        )
+    elif target == "ecs" and "terraform" in path:
+        return (
+            "- Generate ECS Fargate infrastructure (NOT EC2)\n"
+            "- Include: ECR repo, ECS cluster, task definition, ECS service, ALB, security groups\n"
+            "- Use default VPC and subnets\n"
+            "- Output alb_url from ALB DNS name\n"
+            "- No key pairs, no EC2 instances\n"
+        )
+    elif target == "ecs" and ".github" in path and "deploy" in path:
+        return (
+            "- Build Docker image and push to ECR\n"
+            "- Update ECS service with force-new-deployment\n"
+            "- DO NOT use Ansible or SSH\n"
+            "- Jobs: terraform → build-push → deploy-ecs → verify\n"
+        )
+    elif target == "ec2" and ("ansible" in path or "playbook" in path):
+        return (
+            "- Install app directly on the host (no Docker)\n"
+            "- For nginx: install nginx, copy html files, configure site\n"
+        )
+    else:
+        return "- Generate appropriate content for the deployment target\n"
+
+
 def _strip_fences(text: str) -> str:
     lines = text.splitlines()
-    if lines and lines[0].startswith("```"):
-        lines = lines[1:]
-    if lines and lines[-1].startswith("```"):
-        lines = lines[:-1]
+    if lines and lines[0].startswith("```"): lines = lines[1:]
+    if lines and lines[-1].startswith("```"): lines = lines[:-1]
     return "\n".join(lines).strip()
 
 
 def _simple_diff(original: str, fixed: str) -> str:
-    orig    = original.splitlines()
-    new     = fixed.splitlines()
+    orig = original.splitlines(); new = fixed.splitlines()
     changed = []
     for i in range(min(len(orig), len(new))):
         if orig[i] != new[i]:
             changed.append(f"Line {i+1}:\n  - {orig[i]}\n  + {new[i]}")
         if len(changed) >= 5:
-            changed.append("... more changes")
-            break
-    if len(new) > len(orig):
-        changed.append(f"+ {len(new)-len(orig)} lines added")
-    elif len(orig) > len(new):
-        changed.append(f"- {len(orig)-len(new)} lines removed")
+            changed.append("... more changes"); break
+    if len(new) > len(orig):   changed.append(f"+ {len(new)-len(orig)} lines added")
+    elif len(orig) > len(new): changed.append(f"- {len(orig)-len(new)} lines removed")
     return "\n".join(changed) if changed else "Minor changes"
 
 

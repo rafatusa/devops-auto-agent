@@ -114,6 +114,36 @@ def extract_intent(text: str) -> dict:
                     result["project"] = candidate
                     break
 
+    # Deployment target
+    if any(w in t for w in ["ecs", "fargate", "container service", "elastic container"]):
+        result["target"] = "ecs"
+    elif any(w in t for w in ["ec2 with docker", "docker on ec2", "ec2 docker"]):
+        result["target"] = "ec2-docker"
+    elif any(w in t for w in ["docker", "container"]) and "ecs" not in t:
+        result["target"] = "ask"   # ambiguous — bot must ask
+    elif any(w in t for w in ["ec2", "vm", "instance", "directly"]):
+        result["target"] = "ec2"
+
+    # Branch name
+    branch_match = re.search(r"(?:branch|on|from|cut)\s+([\w/.-]+)", t)
+    if branch_match:
+        candidate = branch_match.group(1)
+        skip = {"main","aws","ec2","docker","nginx","the","a","an"}
+        if candidate not in skip:
+            result["branch"] = candidate
+
+    # PR intent
+    if any(w in t for w in ["pull request", "pr", "create pr", "open pr"]):
+        result["pr"] = True
+
+    # Merge intent
+    if "merge" in t:
+        result["merge"] = True
+        merge_match = re.search(r"merge\s+([\w/.-]+)\s+(?:to|into)\s+([\w/.-]+)", t)
+        if merge_match:
+            result["merge_from"] = merge_match.group(1)
+            result["merge_to"]   = merge_match.group(2)
+
     # File path (for update intent)
     file_match = re.search(r"([\w/.-]+\.(?:html|yml|yaml|tf|py|js|json|md|sh))", text)
     if file_match:
@@ -132,9 +162,19 @@ def missing_fields(answers: dict) -> list:
 
 FIELD_QUESTIONS = {
     "project": "Project name?",
-    "app":     "What to deploy? (nginx / node / python / spring-boot)",
+    "app":     "What to deploy? (e.g. nginx, node, python, spring-boot)",
+    "target":  "Where to run it?\n  ec2       — directly on EC2 (no Docker)\n  ec2-docker — Docker container on EC2\n  ecs       — Amazon ECS Fargate (fully managed)",
     "repo":    "GitHub repo name?",
-    "region":  "AWS region? (default: us-east-1)",
+    "branch":  "Which branch? (e.g. main, feature/docker, dev)",
+    "region":  "AWS region? (e.g. us-east-1, ap-southeast-1)",
+}
+
+DEPLOY_FIELDS = ["project", "app", "target", "repo", "branch", "region"]
+
+TARGET_ALIASES = {
+    "1": "ec2", "direct": "ec2", "vm": "ec2",
+    "2": "ec2-docker", "docker": "ec2-docker", "ec2 docker": "ec2-docker",
+    "3": "ecs", "fargate": "ecs", "container service": "ecs", "ecs fargate": "ecs",
 }
 
 
@@ -309,16 +349,20 @@ async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sessions[uid] = {"mode": "gh_menu", "answers": {}}
         await update.message.reply_text(
             "GitHub Agent — what do you want to do?\n\n"
-            "  push    — push a file to repo\n"
-            "  pull    — get a file from repo\n"
-            "  trigger — run pipeline\n"
-            "  status  — pipeline status\n"
-            "  logs    — last pipeline logs\n"
-            "  list    — list repos\n"
-            "  files   — list files in repo\n"
-            "  create  — create repo\n"
-            "  delete  — delete repo\n"
-            "  secrets — set secrets\n"
+            "  push      — push a file to repo\n"
+            "  pull      — get a file from repo\n"
+            "  trigger   — run pipeline\n"
+            "  status    — pipeline status\n"
+            "  logs      — last pipeline logs\n"
+            "  files     — list files in repo\n"
+            "  branches  — list branches\n"
+            "  branch    — create a branch\n"
+            "  pr        — create pull request\n"
+            "  merge     — merge branch into another\n"
+            "  list      — list repos\n"
+            "  create    — create repo\n"
+            "  delete    — delete repo\n"
+            "  secrets   — set secrets\n"
         )
         return
 
@@ -482,7 +526,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── GitHub conversational menu ───────────────────────────────────────────
     if mode == "gh_menu":
         action = text.strip().lower()
-        if action in ("push", "pull", "trigger", "status", "logs", "files", "list", "create", "delete"):
+        valid = ("push","pull","trigger","status","logs","files","branches","branch",
+                 "pr","merge","list","create","delete","secrets")
+        if action in valid:
             if action == "list":
                 r = github_agent.handle("list_repos", {})
                 lines = [f"{x['name']} — {x['url']}" for x in r.get("repos",[])[:15]]
@@ -492,7 +538,106 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 sessions[uid] = {"mode": f"gh_{action}_repo", "answers": {}}
                 await update.message.reply_text("Repo name?")
         else:
-            await update.message.reply_text("Choose: push / pull / trigger / status / logs / files / list / create / delete")
+            await update.message.reply_text(
+                "Choose: push / pull / trigger / status / logs / files\n"
+                "        branches / branch / pr / merge / list / create / delete"
+            )
+        return
+
+    # Branch operations
+    if mode == "gh_branch_repo":
+        sess["answers"]["repo"] = text.strip()
+        sessions[uid] = {"mode": "gh_branch_name", "answers": sess["answers"]}
+        await update.message.reply_text("New branch name?")
+        return
+
+    if mode == "gh_branch_name":
+        sess["answers"]["branch"] = text.strip()
+        sessions[uid] = {"mode": "gh_branch_from", "answers": sess["answers"]}
+        await update.message.reply_text("Create from which branch? (default: main)")
+        return
+
+    if mode == "gh_branch_from":
+        from_branch = text.strip() or "main"
+        repo   = sess["answers"]["repo"]
+        branch = sess["answers"]["branch"]
+        r      = github_agent.create_branch(repo, branch, from_branch)
+        sessions.pop(uid, None)
+        await update.message.reply_text(
+            f"Branch '{branch}' {r.get('status')} in {repo}" if "error" not in r
+            else f"Error: {r['error']}"
+        )
+        return
+
+    if mode == "gh_branches_repo":
+        repo = text.strip()
+        sessions.pop(uid, None)
+        r    = github_agent.list_branches(repo)
+        branches = r.get("branches", [])
+        await update.message.reply_text(
+            f"Branches in {repo}:\n" + "\n".join(f"  {b}" for b in branches)
+            if branches else f"No branches found or error: {r.get('error')}"
+        )
+        return
+
+    # PR
+    if mode == "gh_pr_repo":
+        sess["answers"]["repo"] = text.strip()
+        sessions[uid] = {"mode": "gh_pr_from", "answers": sess["answers"]}
+        await update.message.reply_text("From branch?")
+        return
+
+    if mode == "gh_pr_from":
+        sess["answers"]["from"] = text.strip()
+        sessions[uid] = {"mode": "gh_pr_to", "answers": sess["answers"]}
+        await update.message.reply_text("To branch?")
+        return
+
+    if mode == "gh_pr_to":
+        sess["answers"]["to"] = text.strip()
+        sessions[uid] = {"mode": "gh_pr_title", "answers": sess["answers"]}
+        await update.message.reply_text("PR title? (or press enter for default)")
+        return
+
+    if mode == "gh_pr_title":
+        title = text.strip() or None
+        r     = github_agent.create_pull_request(
+            sess["answers"]["repo"],
+            sess["answers"]["from"],
+            sess["answers"]["to"],
+            title=title,
+        )
+        sessions.pop(uid, None)
+        if r.get("status") in ("created", "exists"):
+            await update.message.reply_text(f"PR {r['status']}: {r['url']}")
+        else:
+            await update.message.reply_text(f"Error: {r.get('error')}")
+        return
+
+    # Merge
+    if mode == "gh_merge_repo":
+        sess["answers"]["repo"] = text.strip()
+        sessions[uid] = {"mode": "gh_merge_from", "answers": sess["answers"]}
+        await update.message.reply_text("Merge FROM which branch?")
+        return
+
+    if mode == "gh_merge_from":
+        sess["answers"]["from"] = text.strip()
+        sessions[uid] = {"mode": "gh_merge_to", "answers": sess["answers"]}
+        await update.message.reply_text("Merge INTO which branch?")
+        return
+
+    if mode == "gh_merge_to":
+        r = github_agent.merge_branch(
+            sess["answers"]["repo"],
+            sess["answers"]["from"],
+            text.strip(),
+        )
+        sessions.pop(uid, None)
+        await update.message.reply_text(
+            f"Merged {sess['answers']['from']} → {text.strip()}" if r.get("status") in ("merged","nothing_to_merge")
+            else f"Error: {r.get('error')}"
+        )
         return
 
     if mode == "gh_push_repo":
@@ -595,6 +740,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Delete: {r.get('status')}")
         return
 
+    if mode == "post_deploy_pr":
+        if text.strip().lower() in ("yes", "y"):
+            sessions[uid] = {"mode": "post_deploy_pr_target", "answers": sess["answers"]}
+            await update.message.reply_text("Merge into which branch? (e.g. main)")
+        else:
+            sessions.pop(uid, None)
+            await update.message.reply_text("Done. No PR created.")
+        return
+
+    if mode == "post_deploy_pr_target":
+        to_branch = text.strip()
+        repo      = sess["answers"]["repo"]
+        from_b    = sess["answers"]["branch"]
+        r         = github_agent.create_pull_request(repo, from_b, to_branch)
+        sessions.pop(uid, None)
+        if r.get("status") in ("created", "exists"):
+            await update.message.reply_text(f"PR created: {r['url']}")
+        else:
+            await update.message.reply_text(f"PR error: {r.get('error')}")
+        return
+
     if mode == "github_push":
         r = github_agent.handle("push_file", {"repo": sess["repo"], "path": sess["file"], "content": text})
         sessions.pop(uid, None)
@@ -649,18 +815,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "collect":
-        missing = sess.get("missing", [])
-        answers = sess.get("answers", {})
+        missing  = sess.get("missing", [])
+        answers  = sess.get("answers", {})
         if missing:
             key = missing[0]
-            val = text.strip()
+            val = text.strip().lower()
+            # Normalize target answer
+            if key == "target":
+                val = TARGET_ALIASES.get(val, val)
+                if val not in ("ec2", "ec2-docker", "ecs"):
+                    await update.message.reply_text(
+                        "Please choose:\n  ec2 — directly on EC2\n  ec2-docker — Docker on EC2\n  ecs — Amazon ECS Fargate"
+                    )
+                    return
             answers[key] = val
             missing.pop(0)
-            sess["missing"] = missing
-            sess["answers"] = answers
+            sess["missing"]  = missing
+            sess["answers"]  = answers
             if missing:
                 await update.message.reply_text(FIELD_QUESTIONS.get(missing[0], f"{missing[0]}?"))
             else:
+                answers["repo_name"] = answers.get("repo")
                 await _show_confirm(update, uid, answers)
         return
 
@@ -711,43 +886,49 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Natural language ──────────────────────────────────────────────────────
     intent = extract_intent(text)
 
-    if intent.get("intent") == "trigger":
-        repo = intent.get("repo_name") or intent.get("project")
-        if repo:
-            await update.message.reply_text(f"Triggering pipeline in {repo}...")
-            r = github_agent.handle("trigger", {"repo": repo, "workflow": "deploy.yml"})
-            await update.message.reply_text(f"{r.get('status')} — {r.get('url', r.get('error',''))}")
-        else:
-            sessions[uid] = {"mode": "trigger_repo", "answers": {}}
-            await update.message.reply_text("Repo name?")
-        return
+
 
     if intent.get("intent") == "update":
         repo    = intent.get("repo_name")
         file_   = intent.get("file")
+        branch  = intent.get("branch", "main")
         if repo and file_:
-            # Have both — go straight to content
-            sessions[uid] = {"mode": "update_content", "answers": {"repo": repo, "file": file_}}
-            await update.message.reply_text(f"Paste new content for {file_} in {repo}:")
+            sessions[uid] = {"mode": "update_content", "answers": {"repo": repo, "file": file_, "branch": branch}}
+            await update.message.reply_text(f"Paste new content for {file_} in {repo} ({branch}):")
         elif repo:
-            sessions[uid] = {"mode": "update_file", "answers": {"repo": repo}}
+            sessions[uid] = {"mode": "update_file", "answers": {"repo": repo, "branch": branch}}
             await update.message.reply_text("Which file to update? (e.g. html/index.html)")
         else:
             sessions[uid] = {"mode": "update_repo", "answers": {}}
             await update.message.reply_text("Repo name? (e.g. web-app2)")
         return
 
+    if intent.get("intent") == "trigger":
+        repo   = intent.get("repo_name") or intent.get("project")
+        branch = intent.get("branch", "main")
+        if repo:
+            await update.message.reply_text(f"Triggering pipeline in {repo} on branch {branch}...")
+            r = github_agent.trigger_pipeline(repo, "deploy.yml", branch)
+            await update.message.reply_text(f"{r.get('status')} — {r.get('url', r.get('error',''))}")
+        else:
+            sessions[uid] = {"mode": "trigger_repo", "answers": {}}
+            await update.message.reply_text("Repo name?")
+        return
+
     if intent.get("intent") == "deploy":
+        raw_target = intent.get("target", "")
+        # If target is ambiguous (user said docker/container) — force ask
+        target = None if raw_target == "ask" else (raw_target or None)
         answers = {
             "project": intent.get("project"),
             "app":     intent.get("app"),
+            "target":  target,
             "repo":    intent.get("repo_name") or intent.get("project"),
-            "region":  intent.get("region", "us-east-1"),
-            "cloud":   intent.get("cloud", "AWS"),
-            "iac":     intent.get("iac", "terraform"),
-            "config":  intent.get("config", "ansible"),
+            "branch":  intent.get("branch"),
+            "region":  intent.get("region"),
         }
-        missing = [f for f in ["project","app","repo"] if not answers.get(f)]
+        # Always ask all missing fields
+        missing = [f for f in ["project", "app", "target", "repo", "branch", "region"] if not answers.get(f)]
         if missing:
             sessions[uid] = {"mode": "collect", "answers": answers, "missing": missing}
             await update.message.reply_text(FIELD_QUESTIONS.get(missing[0], f"{missing[0]}?"))
@@ -780,11 +961,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _show_confirm(update, uid, answers):
     sessions[uid] = {"mode": "confirm_deploy", "answers": answers}
+    target_label = {
+        "ec2":        "EC2 direct (no Docker)",
+        "ec2-docker": "Docker on EC2",
+        "ecs":        "Amazon ECS Fargate",
+    }.get(answers.get("target","ec2"), answers.get("target","ec2"))
     await update.message.reply_text(
-        f"Ready:\n"
+        f"Ready to deploy:\n"
         f"  Project: {answers.get('project')}\n"
         f"  App:     {answers.get('app')}\n"
+        f"  Target:  {target_label}\n"
         f"  Repo:    {answers.get('repo_name') or answers.get('repo')}\n"
+        f"  Branch:  {answers.get('branch','main')}\n"
         f"  Region:  {answers.get('region','us-east-1')}\n\n"
         f"Proceed? (yes/no)"
     )
@@ -808,14 +996,34 @@ async def _run_deploy(update, uid, answers):
             app         = answers["app"],
             repo_name   = answers.get("repo_name") or answers.get("repo") or answers["project"],
             region      = answers.get("region", "us-east-1"),
+            branch      = answers.get("branch", "main"),
+            target      = answers.get("target", "ec2"),
             progress_cb = cb,
         )
         if result["status"] == "success":
+            branch = answers.get("branch", "main")
+            ip  = result.get("ip", "")
+            url = f"http://{ip}" if ip else "(IP not found — check pipeline logs)"
             await update.message.reply_text(
-                f"Deployed!\nProject: {answers['project']}\nURL: http://{result['ip']}"
+                f"✅ Deployed!\n"
+                f"Project: {answers['project']}\n"
+                f"Branch:  {branch}\n"
+                f"URL:     {url}"
             )
+            if branch != "main":
+                repo = answers.get("repo_name") or answers.get("repo") or answers["project"]
+                sessions[uid] = {"mode": "post_deploy_pr", "answers": {
+                    "repo": repo, "branch": branch
+                }}
+                await update.message.reply_text(
+                    f"Pipeline succeeded on branch '{branch}'.\n"
+                    f"Create PR to merge into another branch? (yes/no)"
+                )
+                return
         else:
-            await update.message.reply_text(f"{result['status']}: {result.get('message','')}")
+            await update.message.reply_text(
+                f"❌ {result['status']}: {result.get('message', '')}"
+            )
         sessions.pop(uid, None)
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
