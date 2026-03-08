@@ -75,44 +75,56 @@ class CodeAgent:
                 files.append("html/index.html")
             return files
 
-    # ── Context-aware change planning ─────────────────────────────────────────
 
-    def plan_changes(self, project: str, app: str, region: str,
-                     existing_files: dict) -> dict:
-        """
-        Given existing repo files + new app requirement,
-        AI decides: what to KEEP, UPDATE, or CREATE.
-        Returns {"keep": [...], "update": [...], "create": [...]}
-        """
-        if not existing_files:
-            return {"keep": [], "update": [], "create": self.plan_files(project, app, region)}
 
-        file_summary = "\n".join(
-            f"- {path} ({len(content)} chars)"
-            for path, content in existing_files.items()
-        )
+    # ── Smart deployment planning — fully AI driven ──────────────────────────
+
+    def plan_deployment(self, project: str, app: str, region: str,
+                        target: str, existing_files: dict = None) -> dict:
+        """
+        One AI call decides everything:
+        - What files are needed for this app + target
+        - Which existing files to keep, update, create, or delete
+        Returns {"keep": [...], "update": [...], "create": [...], "delete": [...], "reasoning": "..."}
+        """
+        existing_summary = ""
+        if existing_files:
+            existing_summary = "EXISTING FILES IN REPO:\n" + "\n".join(
+                f"  - {p} ({len(c)} chars)" for p, c in existing_files.items()
+            )
+
+        skills = load_skills("ecs", "docker", "terraform-aws", "ansible", "pipeline")
 
         prompt = (
-            f"The repo already has files. We need to deploy a NEW app type.\n\n"
-            f"Project: {project}\n"
-            f"New app: {app}\n"
-            f"Region: {region}\n\n"
-            f"EXISTING FILES:\n{file_summary}\n\n"
-            f"Decide what to do with each file for '{app}':\n\n"
-            f"Rules:\n"
-            f"- terraform/main.tf — KEEP (infrastructure is the same)\n"
-            f"- deploy.yml / destroy.yml — KEEP (pipeline structure is the same)\n"
-            f"- ansible/playbook.yml — UPDATE if app type changes how server is configured\n"
-            f"- html/index.html — KEEP unless new app has no web UI\n"
-            f"- Dockerfile — CREATE if app uses docker and it doesn't exist yet\n"
-            f"- Any other missing file the new app needs — CREATE\n\n"
-            f"Respond ONLY in this format:\n"
-            f"KEEP: path\n"
-            f"UPDATE: path\n"
-            f"CREATE: path"
+            f"You are a DevOps agent planning a deployment.\n\n"
+            f"Project:  {project}\nApp:      {app}\nTarget:   {target}\nRegion:   {region}\n\n"
+            + (f"{existing_summary}\n\n" if existing_summary else "")
+            + "DEPLOYMENT TARGET MEANINGS:\n"
+            "  ec2        = deploy app directly on EC2 (Ansible, no Docker)\n"
+            "  ec2-docker = run app in Docker container ON EC2 (Ansible installs Docker, runs container)\n"
+            "  ecs        = Amazon ECS Fargate (NO EC2, NO Ansible, ECR + ECS + ALB only)\n\n"
+            "Decide exactly what files are needed and what to do with existing ones.\n"
+            "Think through:\n"
+            "  1. What infrastructure does this target need?\n"
+            "  2. Is Ansible needed? (only for EC2-based targets)\n"
+            "  3. Is a Dockerfile needed? (yes for docker/ecs targets)\n"
+            "  4. What does the pipeline need to do?\n"
+            "  5. What existing files can stay vs need to change?\n\n"
+            f"SKILL REFERENCE:\n{skills}\n\n"
+            "Respond in EXACTLY this format:\n"
+            "KEEP:   path/to/file\n"
+            "UPDATE: path/to/file\n"
+            "CREATE: path/to/file\n"
+            "DELETE: path/to/file\n"
+            "REASON: one line summary\n\n"
+            "Rules:\n"
+            "- If target=ecs: DO NOT include ansible/playbook.yml\n"
+            "- If target=ec2: DO NOT include Dockerfile unless app needs it\n"
+            "- If target=ec2-docker: include both ansible/playbook.yml AND Dockerfile\n"
+            "- Always include terraform/main.tf, deploy.yml, destroy.yml\n"
         )
 
-        result = {"keep": [], "update": [], "create": []}
+        result = {"keep": [], "update": [], "create": [], "delete": [], "reasoning": ""}
         for line in _ask(prompt).splitlines():
             line = line.strip()
             if line.startswith("KEEP:"):
@@ -121,33 +133,32 @@ class CodeAgent:
                 result["update"].append(line.replace("UPDATE:", "").strip())
             elif line.startswith("CREATE:"):
                 result["create"].append(line.replace("CREATE:", "").strip())
+            elif line.startswith("DELETE:"):
+                result["delete"].append(line.replace("DELETE:", "").strip())
+            elif line.startswith("REASON:"):
+                result["reasoning"] = line.replace("REASON:", "").strip()
 
-        logger.info(f"Change plan — keep:{len(result['keep'])} "
-                    f"update:{len(result['update'])} create:{len(result['create'])}")
+        logger.info(f"Plan ({target}): keep={result['keep']} update={result['update']} "
+                    f"create={result['create']} delete={result['delete']}\n"
+                    f"Reason: {result['reasoning']}")
         return result
-
-    # ── Generate files — context-aware ───────────────────────────────────────
 
     def generate_files(self, project: str, app: str, region: str = "us-east-1",
                        existing_files: dict = None, target: str = "ec2") -> dict:
         """
-        Context-aware generation based on target.
-        target: "ec2" | "ec2-docker" | "ecs"
+        Fully dynamic — AI plans everything, then generates each file.
         Returns {path: content} — ONLY files that need to be pushed.
         """
-        if existing_files is not None:
-            plan = self.plan_changes(project, app, region, existing_files, target)
-            to_generate = plan["update"] + plan["create"]
-        else:
-            to_generate    = self.plan_files(project, app, region, target)
-            existing_files = {}
+        existing_files = existing_files or {}
+        plan           = self.plan_deployment(project, app, region, target, existing_files)
+        to_generate    = plan["update"] + plan["create"]
 
         if not to_generate:
             logger.info("Nothing to generate — all files up to date")
             return {}
 
-        # Build context from existing files so Claude can read them
-        context = self._build_context(existing_files)
+        logger.info(f"Reason: {plan['reasoning']}")
+        context = self._build_context(existing_files, plan)
 
         generated = {}
         for path in to_generate:
@@ -157,7 +168,6 @@ class CodeAgent:
             if content:
                 generated[path] = content
                 state.save_file(project, path, content)
-
         return generated
 
     def _build_context(self, existing_files: dict, plan: dict = None) -> str:
@@ -216,7 +226,7 @@ class CodeAgent:
 
         return _strip_fences(_ask(prompt))
 
-    def _gen_destroy(self, project: str, region: str) -> str:
+    def _gen_destroy(self, project: str, region: str, target: str = "ec2") -> str:
         prompt = (
             f"Generate a GitHub Actions destroy.yml for project \"{project}\".\n"
             f"- Terraform destroy with S3 backend in region {region}\n"
