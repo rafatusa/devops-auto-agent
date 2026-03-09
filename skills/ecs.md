@@ -187,3 +187,8 @@ jobs:
 - ECR repo must exist before pipeline runs (terraform creates it)
 - Secrets needed: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, PROJECT_NAME
 - Output: alb_url from terraform
+
+## CRITICAL: Single File Rule
+- ALL terraform code goes in ONE file: `terraform/main.tf`
+- NEVER create separate `outputs.tf`, `variables.tf`, or `providers.tf`
+- Duplicate output names will cause `terraform init` to fail immediately

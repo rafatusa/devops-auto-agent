@@ -54,6 +54,10 @@ data "aws_subnets" "default" {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
   }
+  filter {
+    name   = "availabilityZone"
+    values = ["${var.aws_region}a", "${var.aws_region}b", "${var.aws_region}c"]
+  }
 }
 
 data "aws_ami" "ubuntu" {
@@ -157,7 +161,22 @@ output "instance_id" {
 ## CRITICAL RULES
 - ALL filter blocks MUST be multi-line — never single line
 - NEVER create VPC or subnets — always use data sources
+- NEVER hardcode availability_zone — let AWS pick via subnet_id only
+- ALWAYS filter subnets to zones a, b, c — avoid zones d/e/f which may not support all instance types
 - ALWAYS use lifecycle ignore_changes on key_pair
 - ALWAYS use create_before_destroy on security_group
 - ALWAYS use S3 backend with encrypt=true
 - Tag every resource with Project and ManagedBy
+
+## Destroy pipeline — variable handling
+- Always pass all variables even for destroy
+- Use `-var="public_key=placeholder"` for destroy since key is not needed
+- Add `|| true` after destroy to prevent false failures on already-deleted resources
+- Use `-target` to destroy specific resources if full destroy fails
+
+
+## CRITICAL: Single File Rule
+- ALL terraform code goes in ONE file: `terraform/main.tf`
+- NEVER create separate `outputs.tf`, `variables.tf`, or `providers.tf`
+- Outputs defined in `main.tf` must NOT be repeated anywhere else
+- Duplicate output definitions will cause `terraform init` to fail

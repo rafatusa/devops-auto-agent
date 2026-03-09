@@ -161,6 +161,92 @@ class AWSAgent:
         except Exception as e:
             return {"error": str(e)}
 
+    def clear_tf_state(self, project: str, bucket: str = None) -> dict:
+        """
+        Delete ALL terraform state objects for a project from S3.
+        Clears: tfstate, tfstate.backup, lock file.
+        """
+        bucket = bucket or os.getenv("TF_STATE_BUCKET", "devops-agent-tfstate")
+        s3     = self._s3()
+        keys   = [
+            f"{project}/terraform.tfstate",
+            f"{project}/terraform.tfstate.backup",
+            f"{project}/.terraform.lock.hcl",
+        ]
+        deleted = []
+        errors  = []
+        for key in keys:
+            try:
+                s3.delete_object(Bucket=bucket, Key=key)
+                deleted.append(key)
+                logger.info(f"Deleted S3 object: s3://{bucket}/{key}")
+            except Exception as e:
+                errors.append(f"{key}: {e}")
+
+        # Also check for any other objects under project prefix
+        try:
+            resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"{project}/")
+            for obj in resp.get("Contents", []):
+                key = obj["Key"]
+                if key not in keys:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                    deleted.append(key)
+        except Exception as e:
+            errors.append(f"list: {e}")
+
+        return {"deleted": deleted, "errors": errors, "bucket": bucket, "project": project}
+
+    def nuke_s3_bucket(self, bucket: str = None) -> dict:
+        """
+        Delete ALL objects in the TF state bucket, then delete the bucket itself.
+        WARNING: This removes ALL projects' state.
+        """
+        bucket = bucket or os.getenv("TF_STATE_BUCKET", "devops-agent-tfstate")
+        s3     = self._s3()
+        deleted_objects = []
+        try:
+            # Delete all objects (including all versions if versioned)
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket):
+                objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+                if objs:
+                    s3.delete_objects(Bucket=bucket, Delete={"Objects": objs})
+                    deleted_objects.extend([o["Key"] for o in objs])
+
+            # Delete versioned objects if versioning is enabled
+            try:
+                ver_paginator = s3.get_paginator("list_object_versions")
+                for page in ver_paginator.paginate(Bucket=bucket):
+                    versions = [
+                        {"Key": v["Key"], "VersionId": v["VersionId"]}
+                        for v in page.get("Versions", []) + page.get("DeleteMarkers", [])
+                    ]
+                    if versions:
+                        s3.delete_objects(Bucket=bucket, Delete={"Objects": versions})
+            except Exception:
+                pass  # versioning not enabled
+
+            s3.delete_bucket(Bucket=bucket)
+            return {"status": "deleted", "bucket": bucket, "objects_deleted": len(deleted_objects)}
+        except Exception as e:
+            return {"error": str(e), "bucket": bucket}
+
+    def list_tf_states(self, bucket: str = None) -> dict:
+        """List all terraform state files in the S3 bucket."""
+        bucket = bucket or os.getenv("TF_STATE_BUCKET", "devops-agent-tfstate")
+        try:
+            s3   = self._s3()
+            resp = s3.list_objects_v2(Bucket=bucket)
+            keys = [o["Key"] for o in resp.get("Contents", [])]
+            # Group by project
+            projects = {}
+            for key in keys:
+                proj = key.split("/")[0]
+                projects.setdefault(proj, []).append(key)
+            return {"bucket": bucket, "projects": projects, "total": len(keys)}
+        except Exception as e:
+            return {"error": str(e)}
+
     # ── SSM ───────────────────────────────────────────────────────────────────
 
     def _store_ssm(self, key: str, value: str):

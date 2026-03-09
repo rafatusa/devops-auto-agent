@@ -82,46 +82,58 @@ class CodeAgent:
     def plan_deployment(self, project: str, app: str, region: str,
                         target: str, existing_files: dict = None) -> dict:
         """
-        One AI call decides everything:
-        - What files are needed for this app + target
-        - Which existing files to keep, update, create, or delete
+        One AI call decides everything.
+        Claude reads the ACTUAL file contents — not just names/sizes —
+        so it can tell if a file already does what's needed or must change.
         Returns {"keep": [...], "update": [...], "create": [...], "delete": [...], "reasoning": "..."}
         """
-        existing_summary = ""
+        existing_files = existing_files or {}
+
+        # Build full file content section — Claude reads every file
+        file_content_section = ""
         if existing_files:
-            existing_summary = "EXISTING FILES IN REPO:\n" + "\n".join(
-                f"  - {p} ({len(c)} chars)" for p, c in existing_files.items()
-            )
+            parts = ["EXISTING FILES IN REPO (full contents):\n"]
+            for path, fcontent in existing_files.items():
+                # Truncate very large files to keep prompt manageable
+                preview = fcontent if len(fcontent) < 2000 else fcontent[:2000] + "\n... (truncated)"
+                parts.append(f"=== {path} ===\n{preview}\n")
+            file_content_section = "\n".join(parts)
 
         skills = load_skills("ecs", "docker", "terraform-aws", "ansible", "pipeline")
 
         prompt = (
             f"You are a DevOps agent planning a deployment.\n\n"
-            f"Project:  {project}\nApp:      {app}\nTarget:   {target}\nRegion:   {region}\n\n"
-            + (f"{existing_summary}\n\n" if existing_summary else "")
-            + "DEPLOYMENT TARGET MEANINGS:\n"
-            "  ec2        = deploy app directly on EC2 (Ansible, no Docker)\n"
-            "  ec2-docker = run app in Docker container ON EC2 (Ansible installs Docker, runs container)\n"
-            "  ecs        = Amazon ECS Fargate (NO EC2, NO Ansible, ECR + ECS + ALB only)\n\n"
-            "Decide exactly what files are needed and what to do with existing ones.\n"
-            "Think through:\n"
-            "  1. What infrastructure does this target need?\n"
-            "  2. Is Ansible needed? (only for EC2-based targets)\n"
-            "  3. Is a Dockerfile needed? (yes for docker/ecs targets)\n"
-            "  4. What does the pipeline need to do?\n"
-            "  5. What existing files can stay vs need to change?\n\n"
+            f"Project: {project} | App: {app} | Target: {target} | Region: {region}\n\n"
+            "DEPLOYMENT TARGET MEANINGS:\n"
+            "  ec2        = deploy app directly on EC2 using Ansible (no Docker)\n"
+            "  ec2-docker = run app in Docker container on EC2 (Ansible installs Docker + runs container)\n"
+            "  ecs        = Amazon ECS Fargate (NO EC2, NO Ansible — ECR + ECS + ALB only)\n\n"
+            + (f"{file_content_section}\n" if file_content_section else "No existing files.\n\n")
+            + "YOUR TASK: Read every existing file above carefully. Then decide:\n"
+            "  - Does this file already work correctly for the new request? → KEEP\n"
+            "  - Does this file exist but needs changes for the new request? → UPDATE\n"
+            "  - Does this file not exist yet but is needed? → CREATE\n"
+            "  - Does this file exist but is no longer needed? → DELETE\n\n"
+            "Think through each file:\n"
+            "  1. Does the existing terraform already provision the right infra for this target?\n"
+            "  2. Does the existing ansible do the right thing for this app + target?\n"
+            "  3. Does the pipeline already match this target's deploy strategy?\n"
+            "  4. Is a Dockerfile needed? Does one already exist and work?\n"
+            "  5. Are there any files that are now wrong/unnecessary for this target?\n\n"
             f"SKILL REFERENCE:\n{skills}\n\n"
-            "Respond in EXACTLY this format:\n"
+            "Respond in EXACTLY this format (one entry per line):\n"
             "KEEP:   path/to/file\n"
             "UPDATE: path/to/file\n"
             "CREATE: path/to/file\n"
             "DELETE: path/to/file\n"
-            "REASON: one line summary\n\n"
-            "Rules:\n"
-            "- If target=ecs: DO NOT include ansible/playbook.yml\n"
-            "- If target=ec2: DO NOT include Dockerfile unless app needs it\n"
-            "- If target=ec2-docker: include both ansible/playbook.yml AND Dockerfile\n"
-            "- Always include terraform/main.tf, deploy.yml, destroy.yml\n"
+            "REASON: one sentence explaining your decisions\n\n"
+            "Hard rules:\n"
+            "- target=ecs → never include ansible/playbook.yml\n"
+            "- target=ec2 → no Dockerfile unless the app itself requires one\n"
+            "- target=ec2-docker → must have ansible/playbook.yml AND Dockerfile\n"
+            "- Always need: terraform/main.tf, deploy.yml, destroy.yml\n"
+            "- Only mark a file UPDATE if the current content actually needs to change\n"
+            "- If a file already correctly handles this app+target, mark it KEEP\n"
         )
 
         result = {"keep": [], "update": [], "create": [], "delete": [], "reasoning": ""}
@@ -138,9 +150,12 @@ class CodeAgent:
             elif line.startswith("REASON:"):
                 result["reasoning"] = line.replace("REASON:", "").strip()
 
-        logger.info(f"Plan ({target}): keep={result['keep']} update={result['update']} "
-                    f"create={result['create']} delete={result['delete']}\n"
-                    f"Reason: {result['reasoning']}")
+        logger.info(
+            f"Plan ({target}): "
+            f"keep={result['keep']} update={result['update']} "
+            f"create={result['create']} delete={result['delete']}\n"
+            f"Reason: {result['reasoning']}"
+        )
         return result
 
     def generate_files(self, project: str, app: str, region: str = "us-east-1",
@@ -255,10 +270,17 @@ class CodeAgent:
     def gen_ansible(self, project: str, app: str, existing: str = "") -> str:
         skill = load_skills(app.lower().replace(" ", "-"), "ansible")
         prompt = (
-            f"Generate ansible/playbook.yml for deploying {app} on Ubuntu 22.04.\n"
+            f"Generate ansible/playbook.yml for deploying {app} on the target server.\n"
             f"Project: {project}\n\n"
             + (f"EXISTING PLAYBOOK (update this):\n{existing}\n\n" if existing else "")
-            + f"Follow ALL skill rules below.\nReturn ONLY YAML, no fences.\n\n{skill}"
+            + f"Follow ALL skill rules below.\nReturn ONLY YAML, no fences.\n\n{skill}\n\n"
+            f"CRITICAL RULES FOR THIS PLAYBOOK:\n"
+            f"1. Always use hosts: all (never hosts: web_servers or any other group name)\n"
+            f"2. Never use copy module with src: pointing to a local path like ../app/ or ../src/\n"
+            f"   Those paths do not exist on the GitHub Actions runner.\n"
+            f"   Instead: use 'content: |' inline, or clone from git, or use template module.\n"
+            f"3. If copying HTML — use src: ../html/index.html ONLY if html/ folder is in the repo\n"
+            f"   Otherwise write the HTML inline with content: |\n"
         )
         content = _strip_fences(_ask(prompt))
         if project: state.save_file(project, "ansible/playbook.yml", content)
@@ -289,33 +311,133 @@ class CodeAgent:
 
     def analyze_and_fix(self, project: str, log_context: str,
                         all_files: dict = None) -> dict:
+        """
+        Single AI call that sees ALL files + ALL logs together.
+        Claude identifies the root cause file and outputs the fixed content directly.
+        No two-step guessing — one call, full context, concrete output.
+        """
         if all_files is None:
             all_files = state.get_all_files(project)
         if not all_files:
             return {"error": "No local files found"}
 
-        file_listing = "\n".join(f"- {p}" for p in all_files)
+        dep    = state.get_deployment(project) or {}
+        skills = load_skills("terraform-aws", "ansible", "pipeline")
+
+        # Build numbered file blocks so Claude can reference exact lines
+        file_blocks = []
+        for path, file_content in all_files.items():
+            numbered = "\n".join(f"{i+1:4}: {l}"
+                                  for i, l in enumerate(file_content.splitlines()))
+            file_blocks.append(f"--- FILE: {path} ---\n{numbered}")
+        all_files_text = "\n\n".join(file_blocks)
+
+        # Smart log slicing — include ALL job sections
+        # Split by job sections and include every section (truncated if huge)
+        log_sections = _split_job_sections(log_context)
+        log_slice    = _build_log_slice(log_sections, max_chars=8000)
+
         resp = _ask(
-            f"Pipeline failed. Which file caused this error and what needs to change?\n\n"
-            f"Files:\n{file_listing}\n\n"
-            f"LOG:\n{log_context[-3000:]}\n\n"
-            f"Respond:\nFILE: <path>\nERROR: <what to fix>"
+            f"A GitHub Actions deployment pipeline failed. Find ALL broken files and fix them.\n\n"
+
+            f"=== PIPELINE LOG (every job section — read ALL of them) ===\n"
+            f"{log_slice}\n\n"
+
+            f"=== ALL DEPLOYMENT FILES (live from repo) ===\n"
+            f"{all_files_text[:5000]}\n\n"
+
+            f"=== BEST PRACTICES REFERENCE ===\n"
+            f"{skills[:1500]}\n\n"
+
+            f"=== YOUR TASK ===\n"
+            f"Read every job section in the log above — [FAILED] and [passed] both.\n\n"
+
+            f"GOLDEN RULE: Change THE MINIMUM number of lines needed to fix the error.\n"
+            f"Do NOT restructure, reformat, reorder, or rewrite working sections.\n"
+            f"If the fix is one line — change only that one line. Keep everything else identical.\n\n"
+
+            f"KNOWN ERROR PATTERNS — fix EXACTLY as described, nothing more:\n"
+            f"  1. 'Could not match supplied host pattern, ignoring: X' or 'skipping: no hosts matched'\n"
+            f"     → ONE change only: find the line 'hosts: X' and change it to 'hosts: all'\n"
+            f"     → Do NOT change gather_facts, vars, tasks, or anything else\n"
+            f"     → The rest of the playbook is working — leave it exactly as-is\n\n"
+            f"  2. 'Could not find or access \'../<path>/\' on the Ansible Controller'\n"
+            f"     → The copy module has a src: path that doesn't exist in the repo\n"
+            f"     → Replace ONLY that copy task's src: line with content: | and inline content\n"
+            f"     → Do NOT change other tasks\n\n"
+            f"  3. 'Colons in unquoted values' at line N column C\n"
+            f"     → Find line N in the file. Quote only that value with double quotes\n"
+            f"     → Change nothing else\n\n"
+            f"  4. Any other error — find the exact broken line from the log, fix only that line\n\n"
+
+            f"OUTPUT FORMAT — for each broken file:\n"
+            f"FILE: <exact path>\n"
+            f"ERROR: <exact quote from log>\n"
+            f"FIXED_CONTENT:\n"
+            f"<the complete file — every line — with only the broken line(s) changed>\n"
+            f"END_FIXED_CONTENT\n\n"
+
+            f"Multiple files? Output multiple FILE blocks.\n"
+            f"No text before FILE: or after END_FIXED_CONTENT.\n"
         )
 
-        file_path = error_desc = None
-        for line in resp.splitlines():
-            if line.startswith("FILE:"):  file_path  = line.replace("FILE:", "").strip()
-            if line.startswith("ERROR:"): error_desc = line.replace("ERROR:", "").strip()
+        # Parse the structured response — may contain MULTIPLE file fix blocks
+        fixes = _parse_fix_blocks(resp)
 
-        if not file_path or file_path not in all_files:
-            for f in all_files:
-                if file_path and (file_path in f or f in str(file_path)):
-                    file_path = f; break
-            else:
-                return self._create_missing(project, file_path, error_desc or log_context)
+        if not fixes:
+            # Fallback — structured parse failed, use fix_file directly
+            logger.warning("analyze_and_fix: no fix blocks parsed, falling back to fix_file")
+            # Try to find file from any FILE: line
+            file_path  = None
+            error_desc = None
+            for line in resp.splitlines():
+                if line.startswith("FILE:"):  file_path  = line.replace("FILE:", "").strip()
+                if line.startswith("ERROR:"): error_desc = line.replace("ERROR:", "").strip()
+            if not file_path or file_path not in all_files:
+                for f in all_files:
+                    if file_path and (file_path in f or f in file_path):
+                        file_path = f; break
+                else:
+                    return self._create_missing(project, file_path, error_desc or log_context)
+            return self.fix_file(project, file_path,
+                                 error_desc or "Fix error from log",
+                                 log_context,
+                                 current_content=all_files.get(file_path))
 
-        return self.fix_file(project, file_path,
-                             error_desc or "Fix error from log", log_context)
+        # Apply ALL fixes found — push each one
+        last_result = None
+        for fix in fixes:
+            file_path     = fix["file"]
+            error_desc    = fix["error"]
+            fixed_content = fix["content"]
+
+            # Resolve path if slightly different from repo path
+            if file_path not in all_files:
+                for f in all_files:
+                    if file_path in f or f in file_path:
+                        file_path = f; break
+
+            if file_path not in all_files:
+                # New file — create it
+                state.save_file(project, file_path, fixed_content)
+                last_result = {"file": file_path, "fixed_content": fixed_content,
+                               "diff_summary": f"Created: {file_path}",
+                               "error_summary": error_desc}
+                continue
+
+            validated = _validate_fix(file_path, fixed_content, all_files.get(file_path, ""))
+            if validated == all_files.get(file_path, ""):
+                logger.warning(f"analyze_and_fix: fix for {file_path} was rejected by validator")
+                continue
+
+            diff = _simple_diff(all_files.get(file_path, ""), validated)
+            state.save_file(project, file_path, validated)
+            last_result = {"file": file_path, "fixed_content": validated,
+                           "diff_summary": diff, "error_summary": error_desc,
+                           "all_fixes": fixes}
+            logger.info(f"analyze_and_fix: applied fix to {file_path}: {error_desc[:80]}")
+
+        return last_result or {"error": "All fixes were rejected by validator"}
 
     def _create_missing(self, project: str, path: str, ctx: str) -> dict:
         dep = state.get_deployment(project) or {}
@@ -330,8 +452,8 @@ class CodeAgent:
                 "diff_summary": f"Created: {path}", "error_summary": f"Missing: {path}"}
 
     def fix_file(self, project: str, file_path: str, error: str,
-                 log_context: str = "") -> dict:
-        current = state.get_file(project, file_path)
+                 log_context: str = "", current_content: str = None) -> dict:
+        current = current_content or state.get_file(project, file_path)
         if not current:
             return {"error": f"File not found: {file_path}"}
 
@@ -340,14 +462,42 @@ class CodeAgent:
         elif ".github" in file_path:   skill = load_skill("pipeline")
         else:                           skill = ""
 
+        # Number the lines so AI can find exact line from error message
+        numbered = "\n".join(f"{i+1:3}: {l}" for i, l in enumerate(current.splitlines()))
+
         fixed = _strip_fences(_ask(
-            f"Fix ONLY the broken lines in this file. Minimal change only.\n\n"
-            f"FILE: {file_path}\nERROR: {error}\n"
-            f"LOG:\n{log_context[-1500:]}\n\n"
-            + (f"SKILL:\n{skill}\n\n" if skill else "")
-            + f"CURRENT FILE:\n{current}\n\n"
-            f"Return COMPLETE file with ONLY broken lines fixed. No fences."
+            f"You are fixing a broken deployment file. Output ONLY the corrected file — nothing else.\n\n"
+            f"=== PIPELINE ERROR LOG ===\n"
+            f"{log_context[-4000:]}\n\n"
+            f"=== FILE TO FIX: {file_path} ===\n"
+            f"{numbered}\n\n"
+            + (f"=== SKILL REFERENCE ===\n{skill}\n\n" if skill else "")
+            + f"=== YOUR TASK ===\n"
+            f"1. Read the error log above and find the EXACT line number and column mentioned\n"
+            f"2. Look at that line number in the file above\n"
+            f"3. Apply the fix that resolves that specific error\n"
+            f"4. Output the COMPLETE fixed file — every line, including unchanged ones\n\n"
+            f"=== OUTPUT FORMAT ===\n"
+            f"Your entire response must be the file content only.\n"
+            f"Start your response with the first line of the file.\n"
+            f"No explanations. No markdown. No code fences. No preamble.\n"
+            f"Just the complete fixed file, ready to be saved as {file_path}\n"
         ))
+
+        # Validate output is actual file content, not explanation text
+        # Retry with even stricter prompt if AI wrote prose instead of code
+        fixed = _validate_fix(file_path, fixed, current)
+        if fixed == current:
+            logger.warning(f"fix_file: first attempt wrote prose — retrying with strict prompt")
+            fixed = _strip_fences(_ask(
+                f"Output ONLY the content of {file_path} with this one fix applied.\n"
+                f"Do not write any words. Start with the first line of the file immediately.\n\n"
+                f"ERROR TO FIX: {error}\n\n"
+                f"CURRENT FILE:\n{current}\n\n"
+                f"Fixed file content:"
+            ))
+            fixed = _validate_fix(file_path, fixed, current)
+
         diff = _simple_diff(current, fixed)
         state.save_file(project, file_path, fixed)
         return {"file": file_path, "fixed_content": fixed,
@@ -450,6 +600,165 @@ def _target_instructions(target: str, path: str) -> str:
         )
     else:
         return "- Generate appropriate content for the deployment target\n"
+
+
+def _parse_fix_blocks(resp: str) -> list:
+    """
+    Parse one or more FILE/ERROR/FIXED_CONTENT/END_FIXED_CONTENT blocks from AI response.
+    Returns list of {"file": ..., "error": ..., "content": ...}
+    """
+    fixes = []
+    lines = resp.splitlines()
+
+    current_file    = None
+    current_error   = None
+    current_content = []
+    in_fixed        = False
+
+    for line in lines:
+        if line.startswith("FILE:") and not in_fixed:
+            # Save previous block if exists
+            if current_file and current_content:
+                fixes.append({
+                    "file":    current_file,
+                    "error":   current_error or "",
+                    "content": "\n".join(current_content).strip(),
+                })
+            current_file    = line.replace("FILE:", "").strip()
+            current_error   = None
+            current_content = []
+            in_fixed        = False
+        elif line.startswith("ERROR:") and not in_fixed:
+            current_error = line.replace("ERROR:", "").strip()
+        elif line.strip() == "FIXED_CONTENT:":
+            in_fixed = True
+        elif line.strip() == "END_FIXED_CONTENT":
+            in_fixed = False
+            if current_file and current_content:
+                fixes.append({
+                    "file":    current_file,
+                    "error":   current_error or "",
+                    "content": "\n".join(current_content).strip(),
+                })
+            current_file    = None
+            current_error   = None
+            current_content = []
+        elif in_fixed:
+            current_content.append(line)
+
+    # Catch block without END_FIXED_CONTENT
+    if current_file and current_content:
+        fixes.append({
+            "file":    current_file,
+            "error":   current_error or "",
+            "content": "\n".join(current_content).strip(),
+        })
+
+    return fixes
+
+
+def _split_job_sections(log: str) -> list:
+    """Split combined log into individual job sections."""
+    sections = []
+    current_name = "unknown"
+    current_lines = []
+
+    for line in log.splitlines():
+        if line.startswith("=== JOB:") and "===" in line[8:]:
+            if current_lines:
+                sections.append({"name": current_name, "log": "\n".join(current_lines)})
+            current_name  = line
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        sections.append({"name": current_name, "log": "\n".join(current_lines)})
+
+    return sections
+
+
+def _build_log_slice(sections: list, max_chars: int = 8000) -> str:
+    """
+    Include every job section but truncate long ones.
+    Passed jobs with warnings get their full log — they're often the root cause.
+    Failed jobs get truncated to save space if they're noisy.
+    """
+    if not sections:
+        return ""
+
+    # Budget per section — passed jobs get priority (may contain silent failures)
+    # Give each section a base budget, then distribute remaining chars
+    base_per_section = max_chars // max(len(sections), 1)
+
+    parts = []
+    for section in sections:
+        log   = section["log"]
+        name  = section["name"]
+        is_failed = "[FAILED]" in name
+
+        if is_failed:
+            # For failed jobs: take head (setup) + tail (actual error)
+            budget = base_per_section
+            if len(log) > budget:
+                half = budget // 2
+                log  = log[:half] + "\n...(truncated)...\n" + log[-half:]
+        else:
+            # For passed jobs: keep full log — warnings are here
+            budget = base_per_section * 2
+            if len(log) > budget:
+                log = log[:budget] + "\n...(truncated)..."
+
+        parts.append(log)
+
+    return "\n\n".join(parts)
+
+
+def _validate_fix(file_path: str, fixed: str, original: str) -> str:
+    """
+    Detect if AI wrote explanation text instead of file content.
+    If so, return the original — better to keep working code than corrupt it.
+    """
+    if not fixed:
+        logger.warning("fix_file: AI returned empty content — keeping original")
+        return original
+
+    first_lines = fixed.strip()[:300].lower()
+
+    # Signs the AI wrote an explanation instead of file content
+    explanation_signs = [
+        "looking at the",
+        "the actual error",
+        "the error is",
+        "based on the log",
+        "analyzing the",
+        "the pipeline log",
+        "the issue is",
+        "the problem is",
+        "i can see that",
+        "examining the",
+    ]
+
+    for sign in explanation_signs:
+        if sign in first_lines:
+            logger.warning(f"fix_file: AI wrote explanation instead of file content (detected: '{sign}') — keeping original")
+            return original
+
+    # For YAML files — check it starts with valid YAML indicators
+    if file_path.endswith((".yml", ".yaml")):
+        stripped = fixed.strip()
+        if not (stripped.startswith("---") or stripped.startswith("-") or stripped.startswith("#")):
+            logger.warning("fix_file: YAML file doesn't start with valid YAML — keeping original")
+            return original
+
+    # For HCL/terraform — check it starts with valid terraform
+    if file_path.endswith(".tf"):
+        stripped = fixed.strip()
+        if not any(stripped.startswith(kw) for kw in ["terraform", "provider", "resource", "variable", "output", "data", "#"]):
+            logger.warning("fix_file: Terraform file doesn't start with valid HCL — keeping original")
+            return original
+
+    return fixed
 
 
 def _strip_fences(text: str) -> str:

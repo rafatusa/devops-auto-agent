@@ -13,6 +13,41 @@ from agents.github_agent import github_agent
 from agents.code_agent   import code_agent
 from agents.error_agent  import error_agent
 
+def _extract_display_error(raw_log: str) -> str:
+    """Extract a clean error summary from raw combined job log for display."""
+    import re
+    if not raw_log:
+        return "Unknown error"
+    patterns = [
+        r"(?i)fatal:.*",
+        r"(?i)error:.*process completed.*",
+        r"(?i)could not find or access.*",
+        r"(?i)could not match supplied host.*",
+        r"(?i)skipping: no hosts matched",
+        r"(?i)permission denied.*",
+        r"(?i)no such file.*",
+    ]
+    found = []
+    for line in raw_log.splitlines():
+        s = re.sub(r"^\d{4}-\d{2}-\d{2}T[\d:.Z]+ *", "", line.strip())
+        s = re.sub(r"^##\[.*?\] *", "", s).strip()
+        if not s or s.startswith("==="):
+            continue
+        for pat in patterns:
+            if re.search(pat, s):
+                found.append(s[:200])
+                break
+        if len(found) >= 2:
+            break
+    if found:
+        return " | ".join(found)
+    for line in reversed(raw_log.splitlines()):
+        s = line.strip()
+        if s and len(s) > 10 and "===" not in s:
+            return s[:300]
+    return raw_log[:300]
+
+
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES         = 5
@@ -144,23 +179,54 @@ class Orchestrator:
             # Pass existing files so code_agent can see what's there
             # and only generate what actually needs to change for this app
             await cb(f"Analysing what needs to change for '{app}' on {target}...")
-            files_to_push = code_agent.generate_files(
-                project, app, region,
-                existing_files=repo_files,
-                target=target,
-            )
+
+            # plan_deployment reads FULL file contents so Claude decides intelligently
+            plan = code_agent.plan_deployment(project, app, region, target, repo_files)
+
+            # Show user exactly what will change before touching anything
+            if plan["keep"]:
+                await cb(f"✔ Keeping unchanged: {plan['keep']}")
+            if plan["update"]:
+                await cb(f"✏ Updating: {plan['update']}")
+            if plan["create"]:
+                await cb(f"➕ Creating new: {plan['create']}")
+            if plan["delete"]:
+                await cb(f"🗑 Removing: {plan['delete']}")
+            await cb(f"Reason: {plan['reasoning']}")
+
+            to_generate = plan["update"] + plan["create"]
+
+            if not to_generate and not plan["delete"]:
+                await cb(f"✅ No changes needed — branch '{branch}' is already up to date")
+                files_to_push = {}
+            else:
+                # Generate only what changed
+                files_to_push = code_agent.generate_files(
+                    project, app, region,
+                    existing_files=repo_files,
+                    target=target,
+                )
 
             state.log_step(project, "generate_files", "done",
                            result=f"{len(files_to_push)} files to push")
 
             if files_to_push:
-                await cb(f"Pushing {len(files_to_push)} changed files: {list(files_to_push.keys())}")
+                await cb(f"Pushing {len(files_to_push)} file(s) to '{branch}'...")
                 push_result = github_agent.push_files(repo_name, files_to_push, branch=branch)
                 if push_result.get("failed"):
                     await cb(f"Warning: failed to push: {push_result['failed']}")
-                await cb(f"Pushed {len(push_result.get('pushed', []))} files to '{branch}'")
-            else:
-                await cb(f"No changes needed — branch '{branch}' is already up to date")
+                await cb(f"Pushed: {push_result.get('pushed', [])}")
+
+            # Delete files no longer needed
+            for path in plan.get("delete", []):
+                try:
+                    if hasattr(github_agent, "delete_file"):
+                        del_result = github_agent.delete_file(repo_name, path, branch=branch)
+                        await cb(f"Deleted {path}: {del_result.get('status', 'done')}")
+                    else:
+                        await cb(f"Skipping delete {path} (update github_agent to enable)")
+                except Exception as e:
+                    await cb(f"Could not delete {path}: {e}")
 
             # Set secrets
             secrets = {
@@ -170,6 +236,8 @@ class Orchestrator:
                 "SSH_PRIVATE_KEY":       ssh_keys["private_key"],
                 "SSH_PUBLIC_KEY":        ssh_keys["public_key"],
                 "PROJECT_NAME":          project,
+                "TF_STATE_BUCKET":       os.getenv("TF_STATE_BUCKET", "devops-agent-tfstate"),
+                "SSH_USER":              os.getenv("SSH_USER", "ubuntu"),
             }
             secret_result = github_agent.set_secrets(repo_name, secrets)
             await cb(f"Set {len(secret_result.get('set', []))} secrets")
@@ -235,34 +303,48 @@ class Orchestrator:
                         if not ip and ec2.get("exists"):
                             ip = ec2.get("ip", "")
                         if not ip:
-                            fresh_ec2 = aws_agent.check_resources(project, region)
+                            fresh_ec2 = aws_agent.check_ec2(project)
                             ip = fresh_ec2.get("ip", "")
                         url = f"http://{ip}" if ip else ""
                     state.update_deployment(project, status="deployed", ec2_ip=ip)
                     state.log_step(project, "pipeline", "done", result=ip)
                     return {"status": "success", "ip": ip, "url": url, "project": project}
 
-                # Pipeline failed
+                # Pipeline failed — capture error before checking retry limit
+                analysis   = error_agent.analyze(
+                    pipeline.get("failed_jobs", []),
+                    all_jobs=pipeline.get("all_jobs", []),
+                )
+                # last_error for display — extract clean summary, not raw log
+                raw_log    = analysis.get("log_context", "") or analysis.get("full_log", "") or ""
+                last_error = _extract_display_error(raw_log)
+                last_error_short = last_error[:300]
+
                 if retry >= MAX_RETRIES:
                     await cb(f"Failed after {MAX_RETRIES} attempts.")
-                    await cb(f"Last error: {last_error}")
+                    await cb(f"Last error: {last_error_short}")
                     await cb(f"Pipeline logs: {pipeline.get('run_url', '')}")
                     break
 
                 retry += 1
                 await cb(f"Pipeline failed — auto-fixing (attempt {retry}/{MAX_RETRIES})...")
+                await cb(f"Failed job: {analysis.get('job_name', 'unknown')}")
 
-                # Fetch latest files from repo before fixing
-                repo_files_now = github_agent.get_existing_files(repo_name)
+                # Always read LIVE files from the actual branch — never trust local state
+                await cb(f"Reading current files from branch '{branch}'...")
+                repo_files_now = github_agent.get_existing_files(repo_name, branch=branch)
+
+                # Sync to local state so fix_file reads the real current content
                 for path, fcontent in repo_files_now.items():
                     state.save_file(project, path, fcontent)
 
-                analysis = error_agent.analyze(pipeline.get("failed_jobs", []))
-                await cb(f"Failed job: {analysis.get('job_name', 'unknown')}")
+                await cb(f"Analysing error against {len(repo_files_now)} live files...")
 
+                # Pass live files directly so Claude sees exactly what's in the repo
                 fix_result = code_agent.analyze_and_fix(
                     project,
                     analysis.get("log_context", "") or analysis.get("full_log", ""),
+                    all_files=repo_files_now,
                 )
 
                 if "error" in fix_result:
@@ -270,6 +352,19 @@ class Orchestrator:
                     await cb(f"Cannot auto-fix: {last_error}")
                     await cb(f"Pipeline: {pipeline.get('run_url', '')}")
                     break
+
+                # Push ALL fixed files (may be multiple)
+                all_fixes = fix_result.get("all_fixes", [fix_result])
+                for fx in all_fixes:
+                    fx_path    = fx.get("file") or fix_result.get("file")
+                    fx_content = fx.get("content") or fx.get("fixed_content")
+                    if fx_path and fx_content:
+                        github_agent.push_single_file(
+                            repo_name, fx_path, fx_content,
+                            f"fix: {fx.get('error','')[:60]} (attempt {retry})",
+                            branch=branch,
+                        )
+                        await cb(f"Pushed fix: {fx_path}")
 
                 last_error = fix_result.get("error_summary", "unknown")
                 await cb(
@@ -482,7 +577,10 @@ class Orchestrator:
                 for path, fcontent in repo_files_now.items():
                     state.save_file(project, path, fcontent)
 
-                analysis   = error_agent.analyze(pipeline.get("failed_jobs", []))
+                analysis   = error_agent.analyze(
+                    pipeline.get("failed_jobs", []),
+                    all_jobs=pipeline.get("all_jobs", []),
+                )
                 fix_result = code_agent.analyze_and_fix(
                     project,
                     analysis.get("log_context", "") or analysis.get("full_log", ""),

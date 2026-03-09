@@ -80,6 +80,21 @@ class GitHubAgent:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
+    def delete_file(self, repo_name: str, file_path: str, branch: str = "main") -> dict:
+        """Delete a single file from a branch."""
+        try:
+            repo = self._user().get_repo(repo_name)
+            f    = repo.get_contents(file_path, ref=branch)
+            repo.delete_file(
+                file_path,
+                f"Remove {file_path} (no longer needed)",
+                f.sha,
+                branch=branch
+            )
+            return {"status": "deleted", "file": file_path}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
     def merge_branch(self, repo_name: str, from_branch: str, to_branch: str,
                      message: str = None) -> dict:
         """Merge any branch into any other branch."""
@@ -231,15 +246,21 @@ class GitHubAgent:
             if latest.status == "completed":
                 for job in latest.jobs():
                     log_text = self._fetch_job_log(repo_name, job.id)
+                    failed_steps = [s.name for s in job.steps if s.conclusion == "failure"]
                     job_info = {
                         "name":         job.name,
                         "conclusion":   job.conclusion,
-                        "failed_steps": [s.name for s in job.steps if s.conclusion == "failure"],
+                        "failed_steps": failed_steps,
                         "log":          log_text,
                     }
                     all_jobs.append(job_info)
-                    if job.conclusion == "failure":
+                    # Mark as failed if: conclusion=failure OR has failed steps
+                    # (catches jobs that show "skipped" but had real errors)
+                    if job.conclusion == "failure" or failed_steps:
                         failed_jobs.append(job_info)
+                # If no failed jobs found, include all jobs — let error_agent find the error
+                if not failed_jobs and latest.conclusion == "failure":
+                    failed_jobs = all_jobs
             return {
                 "status":      latest.status,
                 "conclusion":  latest.conclusion,
@@ -259,7 +280,14 @@ class GitHubAgent:
                 headers={"Authorization": f"token {self.token}"},
                 allow_redirects=True, timeout=15,
             )
-            return resp.text[-6000:] if resp.ok else ""
+            if not resp.ok:
+                return ""
+            log = resp.text
+            # Return full log — terraform errors appear at the START not the end
+            # Cap at 20000 chars total: first 10000 + last 10000
+            if len(log) > 20000:
+                return log[:10000] + "\n...(middle truncated)...\n" + log[-10000:]
+            return log
         except:
             return ""
 
