@@ -132,8 +132,38 @@ class AWSAgent:
 
     # ── S3 ────────────────────────────────────────────────────────────────────
 
-    def ensure_s3_bucket(self, bucket: str = "devops-agent-tfstate") -> dict:
+    def get_account_id(self) -> str:
+        """Get the current AWS account ID via STS."""
+        try:
+            sts = boto3.client(
+                "sts",
+                aws_access_key_id     = self.access_key,
+                aws_secret_access_key = self.secret_key,
+                region_name           = self.region,
+            )
+            return sts.get_caller_identity()["Account"]
+        except Exception as e:
+            logger.warning(f"Could not get AWS account ID: {e}")
+            return "unknown"
+
+    def get_state_bucket_name(self) -> str:
+        """
+        Generate a bucket name that is unique per AWS account.
+        Uses account ID suffix so different accounts never share a bucket.
+        If TF_STATE_BUCKET env var is set explicitly, use that instead.
+        """
+        explicit = os.getenv("TF_STATE_BUCKET")
+        if explicit:
+            return explicit
+        account_id = self.get_account_id()
+        # Bucket names must be lowercase, 3-63 chars, no underscores
+        # Format: devops-tfstate-<last8ofaccountid>
+        suffix = account_id[-8:] if account_id != "unknown" else "default"
+        return f"devops-tfstate-{suffix}"
+
+    def ensure_s3_bucket(self, bucket: str = None) -> dict:
         """Create S3 bucket for terraform state if it doesn't exist."""
+        bucket = bucket or self.get_state_bucket_name()
         try:
             s3 = self._s3()
             try:
@@ -152,8 +182,9 @@ class AWSAgent:
         except Exception as e:
             return {"error": str(e)}
 
-    def delete_s3_state(self, project: str, bucket: str = "devops-agent-tfstate") -> dict:
+    def delete_s3_state(self, project: str, bucket: str = None) -> dict:
         """Delete terraform state from S3."""
+        bucket = bucket or self.get_state_bucket_name()
         try:
             key = f"{project}/terraform.tfstate"
             self._s3().delete_object(Bucket=bucket, Key=key)
@@ -166,7 +197,7 @@ class AWSAgent:
         Delete ALL terraform state objects for a project from S3.
         Clears: tfstate, tfstate.backup, lock file.
         """
-        bucket = bucket or os.getenv("TF_STATE_BUCKET", "devops-agent-tfstate")
+        bucket = bucket or self.get_state_bucket_name()
         s3     = self._s3()
         keys   = [
             f"{project}/terraform.tfstate",
@@ -201,7 +232,7 @@ class AWSAgent:
         Delete ALL objects in the TF state bucket, then delete the bucket itself.
         WARNING: This removes ALL projects' state.
         """
-        bucket = bucket or os.getenv("TF_STATE_BUCKET", "devops-agent-tfstate")
+        bucket = bucket or self.get_state_bucket_name()
         s3     = self._s3()
         deleted_objects = []
         try:
@@ -233,7 +264,7 @@ class AWSAgent:
 
     def list_tf_states(self, bucket: str = None) -> dict:
         """List all terraform state files in the S3 bucket."""
-        bucket = bucket or os.getenv("TF_STATE_BUCKET", "devops-agent-tfstate")
+        bucket = bucket or self.get_state_bucket_name()
         try:
             s3   = self._s3()
             resp = s3.list_objects_v2(Bucket=bucket)
@@ -329,7 +360,7 @@ class AWSAgent:
         # S3 state
         try:
             self._s3().head_object(
-                Bucket="devops-agent-tfstate",
+                Bucket=self.get_state_bucket_name(),
                 Key=f"{project}/terraform.tfstate"
             )
             resources["s3_state"] = {"exists": True}
@@ -447,7 +478,7 @@ class AWSAgent:
                 return self.get_ssh_keys(args["project"])
 
             elif action == "ensure_s3":
-                bucket = args.get("bucket", "devops-agent-tfstate")
+                bucket = args.get("bucket") or self.get_state_bucket_name()
                 return self.ensure_s3_bucket(bucket)
 
             elif action == "credentials":

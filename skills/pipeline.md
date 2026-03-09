@@ -28,7 +28,10 @@
 ```yaml
 - name: Terraform Init
   if: steps.check_ec2.outputs.exists != 'true'
-  run: terraform init
+  run: |
+    terraform init \
+      -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+      -backend-config="region=${{ secrets.AWS_REGION }}"
   working-directory: terraform
 
 - name: Terraform Plan
@@ -61,16 +64,17 @@
   run: |
     for i in $(seq 1 30); do
       ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-        -i /tmp/ssh_key ubuntu@${{ needs.provision.outputs.server_ip }} echo ok \
+        -i /tmp/deploy_key ${{ secrets.SSH_USER || 'ubuntu' }}@${{ needs.provision.outputs.server_ip }} echo ok \
         && break || sleep 10
     done
 ```
 
 ## S3 bucket creation — before terraform init
+Always use secrets.TF_STATE_BUCKET and secrets.AWS_REGION — never hardcode bucket name or region.
 ```yaml
 - name: Create S3 state bucket
   if: steps.check_ec2.outputs.exists != 'true'
-  run: aws s3 mb s3://devops-agent-tfstate --region us-east-1 2>/dev/null || true
+  run: aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
 ```
 
 ## Secrets always needed
@@ -80,6 +84,8 @@
 - SSH_PRIVATE_KEY
 - SSH_PUBLIC_KEY
 - PROJECT_NAME
+- TF_STATE_BUCKET  ← account-specific S3 bucket name, never hardcode this
+- SSH_USER         ← default: ubuntu
 
 ## Concurrency — prevent parallel runs
 ```yaml

@@ -244,14 +244,16 @@ class CodeAgent:
     def _gen_destroy(self, project: str, region: str, target: str = "ec2") -> str:
         prompt = (
             f"Generate a GitHub Actions destroy.yml for project \"{project}\".\n"
-            f"- Terraform destroy with S3 backend in region {region}\n"
-            f"- S3 bucket: devops-agent-tfstate, key: {project}/terraform.tfstate\n"
+            f"- Terraform destroy with S3 backend\n"
+            f"- Use -backend-config=\"bucket=${{{{ secrets.TF_STATE_BUCKET }}}}\" "
+            f"-backend-config=\"region=${{{{ secrets.AWS_REGION }}}}\" at terraform init\n"
+            f"- State key: {project}/terraform.tfstate\n"
             f"- Vars: -var=\"public_key=placeholder\" "
             f"-var=\"project_name=${{{{ secrets.PROJECT_NAME }}}}\" "
             f"-var=\"aws_region=${{{{ secrets.AWS_REGION }}}}\"\n"
             f"- Add || true after destroy\n"
             f"- Secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, "
-            f"SSH_PUBLIC_KEY, PROJECT_NAME\n"
+            f"SSH_PUBLIC_KEY, PROJECT_NAME, TF_STATE_BUCKET\n"
             f"Return ONLY the YAML, no explanation, no markdown fences."
         )
         return _strip_fences(_ask(prompt))
@@ -405,7 +407,8 @@ class CodeAgent:
                                  current_content=all_files.get(file_path))
 
         # Apply ALL fixes found — push each one
-        last_result = None
+        last_result  = None
+        rejected     = []
         for fix in fixes:
             file_path     = fix["file"]
             error_desc    = fix["error"]
@@ -425,19 +428,61 @@ class CodeAgent:
                                "error_summary": error_desc}
                 continue
 
-            validated = _validate_fix(file_path, fixed_content, all_files.get(file_path, ""))
-            if validated == all_files.get(file_path, ""):
-                logger.warning(f"analyze_and_fix: fix for {file_path} was rejected by validator")
+            original  = all_files.get(file_path, "")
+            validated = _validate_fix(file_path, fixed_content, original)
+
+            if validated == original:
+                # AI returned same content — no change detected
+                # Could mean: (a) AI couldn't identify the fix, (b) file is already correct
+                logger.warning(f"analyze_and_fix: no change for {file_path} — AI may not have identified fix")
+                rejected.append({"file": file_path, "error": error_desc, "content": fixed_content})
                 continue
 
-            diff = _simple_diff(all_files.get(file_path, ""), validated)
+            diff = _simple_diff(original, validated)
             state.save_file(project, file_path, validated)
             last_result = {"file": file_path, "fixed_content": validated,
                            "diff_summary": diff, "error_summary": error_desc,
                            "all_fixes": fixes}
             logger.info(f"analyze_and_fix: applied fix to {file_path}: {error_desc[:80]}")
 
-        return last_result or {"error": "All fixes were rejected by validator"}
+        if last_result:
+            return last_result
+
+        # All fixes produced no change — fall back to fix_file with the first rejected file
+        # This gives fix_file a chance with a more focused single-file prompt
+        if rejected:
+            fb = rejected[0]
+            fp = fb["file"]
+            logger.warning(f"analyze_and_fix: falling back to fix_file for {fp}")
+            if fp in all_files:
+                return self.fix_file(project, fp, fb["error"],
+                                     log_context, current_content=all_files[fp])
+
+        # Last resort — ask again with a simpler prompt focused on the error only
+        logger.warning("analyze_and_fix: all paths failed — retrying with minimal prompt")
+        simple_resp = _ask(
+            f"Pipeline error: {log_context[-2000:]}\n\n"
+            f"Files:\n" + "\n".join(f"{p}:\n{c[:500]}" for p,c in list(all_files.items())[:4]) +
+            f"\n\nWhich file has the bug and what is the one-line fix?\n"
+            f"Reply:\nFILE: <path>\nFIX: <description of exact change>\n"
+            f"FIXED_CONTENT:\n<complete fixed file>\nEND_FIXED_CONTENT"
+        )
+        fallback_fixes = _parse_fix_blocks(simple_resp)
+        for fix in fallback_fixes:
+            fp      = fix["file"]
+            content = fix["content"]
+            if fp not in all_files:
+                for f in all_files:
+                    if fp in f or f in fp: fp = f; break
+            if fp in all_files and content != all_files[fp]:
+                validated = _validate_fix(fp, content, all_files[fp])
+                if validated != all_files[fp]:
+                    diff = _simple_diff(all_files[fp], validated)
+                    state.save_file(project, fp, validated)
+                    return {"file": fp, "fixed_content": validated,
+                            "diff_summary": diff, "error_summary": fix["error"]}
+
+        return {"error": f"Could not determine fix. Check pipeline logs manually."}
 
     def _create_missing(self, project: str, path: str, ctx: str) -> dict:
         dep = state.get_deployment(project) or {}
@@ -716,46 +761,56 @@ def _build_log_slice(sections: list, max_chars: int = 8000) -> str:
 
 def _validate_fix(file_path: str, fixed: str, original: str) -> str:
     """
-    Detect if AI wrote explanation text instead of file content.
-    If so, return the original — better to keep working code than corrupt it.
+    Only reject output if it is clearly explanation prose, not file content.
+    Be conservative — if in doubt, accept the fix and let the pipeline decide.
+    Rejecting a valid fix is worse than accepting a slightly wrong one.
     """
-    if not fixed:
-        logger.warning("fix_file: AI returned empty content — keeping original")
+    if not fixed or len(fixed.strip()) < 5:
+        logger.warning(f"_validate_fix: empty output for {file_path} — keeping original")
         return original
 
-    first_lines = fixed.strip()[:300].lower()
+    # Strip BOM and whitespace
+    stripped = fixed.strip().lstrip("\ufeff")
+    first300 = stripped[:300].lower()
 
-    # Signs the AI wrote an explanation instead of file content
-    explanation_signs = [
+    # Only reject if the FIRST LINE is clearly an explanation sentence
+    # (not a valid file keyword). We check only the very first line.
+    first_line = stripped.splitlines()[0].lower().strip() if stripped.splitlines() else ""
+
+    # Phrases that ONLY appear at the start of prose, never in real files
+    prose_starters = [
         "looking at the",
         "the actual error",
-        "the error is",
         "based on the log",
         "analyzing the",
         "the pipeline log",
-        "the issue is",
-        "the problem is",
         "i can see that",
         "examining the",
+        "to fix this",
+        "the fix is",
+        "here is the fixed",
+        "here's the fixed",
     ]
 
-    for sign in explanation_signs:
-        if sign in first_lines:
-            logger.warning(f"fix_file: AI wrote explanation instead of file content (detected: '{sign}') — keeping original")
+    for sign in prose_starters:
+        if first_line.startswith(sign):
+            logger.warning(f"_validate_fix: prose detected in {file_path} ('{sign}') — keeping original")
             return original
 
-    # For YAML files — check it starts with valid YAML indicators
+    # For YAML — accept anything that looks remotely like YAML
+    # Valid YAML can start with: ---, -, #, a key (word:), or even 'name:'
     if file_path.endswith((".yml", ".yaml")):
-        stripped = fixed.strip()
-        if not (stripped.startswith("---") or stripped.startswith("-") or stripped.startswith("#")):
-            logger.warning("fix_file: YAML file doesn't start with valid YAML — keeping original")
+        import re
+        if not re.match(r"^(---|#|-[ \t]|\w)", stripped):
+            logger.warning(f"_validate_fix: YAML {file_path} starts with unexpected char — keeping original")
             return original
 
-    # For HCL/terraform — check it starts with valid terraform
+    # For terraform — expanded list of valid starters
     if file_path.endswith(".tf"):
-        stripped = fixed.strip()
-        if not any(stripped.startswith(kw) for kw in ["terraform", "provider", "resource", "variable", "output", "data", "#"]):
-            logger.warning("fix_file: Terraform file doesn't start with valid HCL — keeping original")
+        tf_starters = ["terraform", "provider", "resource", "variable", "output",
+                       "data", "locals", "module", "#", "//"]
+        if not any(stripped.startswith(kw) for kw in tf_starters):
+            logger.warning(f"_validate_fix: HCL {file_path} starts with unexpected content — keeping original")
             return original
 
     return fixed

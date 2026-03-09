@@ -625,7 +625,7 @@ async def cmd_tfstate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == "nuke":
         # Ask for confirmation first
         sessions[uid] = {"mode": "confirm_nuke_s3"}
-        bucket = os.getenv("TF_STATE_BUCKET", "devops-agent-tfstate")
+        bucket = aws_agent.get_state_bucket_name()
         await update.message.reply_text(
             f"⚠️ WARNING: This will delete ALL objects in `{bucket}` and remove the bucket.\n"
             f"This affects ALL projects' Terraform state.\n\n"

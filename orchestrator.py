@@ -13,6 +13,35 @@ from agents.github_agent import github_agent
 from agents.code_agent   import code_agent
 from agents.error_agent  import error_agent
 
+def _patch_terraform_bucket(files: dict, correct_bucket: str, correct_region: str) -> None:
+    """
+    Bucket and region are passed via -backend-config flags at terraform init time.
+    Removes hardcoded bucket/region from backend "s3" blocks so they don't
+    conflict with the -backend-config flags the pipeline passes.
+    """
+    import re as _re
+
+    def clean_backend(m):
+        block = m.group(0)
+        block = _re.sub(r'[ \t]*bucket[ \t]*=[ \t]*"[^"]*"\n', '', block)
+        block = _re.sub(r'[ \t]*region[ \t]*=[ \t]*"[^"]*"\n', '', block)
+        return block
+
+    for path, file_content in list(files.items()):
+        if not path.endswith(".tf"):
+            continue
+        patched = _re.sub(
+            r'backend\s+"s3"\s*\{[^}]+\}',
+            clean_backend,
+            file_content,
+            flags=_re.DOTALL,
+        )
+        if patched != file_content:
+            files[path] = patched
+            logger.info(f"_patch_terraform_bucket: cleaned backend block in {path}")
+
+
+
 def _extract_display_error(raw_log: str) -> str:
     """Extract a clean error summary from raw combined job log for display."""
     import re
@@ -228,7 +257,23 @@ class Orchestrator:
                 except Exception as e:
                     await cb(f"Could not delete {path}: {e}")
 
-            # Set secrets
+            # Ensure S3 terraform state bucket exists in THIS AWS account
+            # Bucket name is auto-derived from account ID — different per account
+            bucket_name = aws_agent.get_state_bucket_name()
+            await cb(f"Ensuring S3 state bucket '{bucket_name}' exists...")
+            bucket_result = aws_agent.ensure_s3_bucket(bucket_name)
+            if bucket_result.get("status") == "created":
+                await cb(f"✓ Created S3 bucket: {bucket_name}")
+            elif bucket_result.get("status") == "exists":
+                await cb(f"✓ S3 bucket ready: {bucket_name}")
+            else:
+                await cb(f"⚠️ S3 bucket warning: {bucket_result.get('error','unknown')}")
+
+            # Patch any terraform files in the branch that have a wrong/old bucket name
+            # This handles the case where the branch was generated with a different account's bucket
+            _patch_terraform_bucket(repo_files, bucket_name, region)
+
+            # Set secrets — TF_STATE_BUCKET uses the account-specific bucket name
             secrets = {
                 "AWS_ACCESS_KEY_ID":     creds["AWS_ACCESS_KEY_ID"],
                 "AWS_SECRET_ACCESS_KEY": creds["AWS_SECRET_ACCESS_KEY"],
@@ -236,7 +281,7 @@ class Orchestrator:
                 "SSH_PRIVATE_KEY":       ssh_keys["private_key"],
                 "SSH_PUBLIC_KEY":        ssh_keys["public_key"],
                 "PROJECT_NAME":          project,
-                "TF_STATE_BUCKET":       os.getenv("TF_STATE_BUCKET", "devops-agent-tfstate"),
+                "TF_STATE_BUCKET":       bucket_name,
                 "SSH_USER":              os.getenv("SSH_USER", "ubuntu"),
             }
             secret_result = github_agent.set_secrets(repo_name, secrets)
@@ -349,8 +394,11 @@ class Orchestrator:
 
                 if "error" in fix_result:
                     last_error = fix_result["error"]
-                    await cb(f"Cannot auto-fix: {last_error}")
-                    await cb(f"Pipeline: {pipeline.get('run_url', '')}")
+                    await cb(
+                        f"Cannot auto-fix: {last_error}\n"
+                        f"Check logs — validator may have rejected AI output.\n"
+                        f"Pipeline: {pipeline.get('run_url', '')}"
+                    )
                     break
 
                 # Push ALL fixed files (may be multiple)

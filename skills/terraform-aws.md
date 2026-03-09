@@ -1,13 +1,18 @@
 # Terraform AWS Best Practices
 
 ## Backend — ALWAYS use S3 for state
+
+CRITICAL: Terraform does NOT allow variables in backend config blocks.
+bucket and region MUST be passed via -backend-config flags at terraform init time.
+The pipeline skill shows how to do this correctly.
+
 ```hcl
 terraform {
   backend "s3" {
-    bucket         = "devops-agent-tfstate"
-    key            = "${var.project_name}/terraform.tfstate"
-    region         = "us-east-1"
-    encrypt        = true
+    key     = "PROJECT_NAME_PLACEHOLDER/terraform.tfstate"
+    encrypt = true
+    # bucket and region are passed via -backend-config at init time:
+    # terraform init -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
   }
   required_providers {
     aws = {
@@ -17,6 +22,8 @@ terraform {
   }
 }
 ```
+
+The key field uses the project name as a prefix — replace PROJECT_NAME_PLACEHOLDER with the actual project name variable value or literal.
 
 ## Provider
 ```hcl
@@ -65,7 +72,7 @@ data "aws_ami" "ubuntu" {
   owners      = ["099720109477"]
   filter {
     name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+    values = ["ubuntu/images/hvm-ssd/ubuntu-*-22.04-amd64-server-*"]
   }
   filter {
     name   = "virtualization-type"
