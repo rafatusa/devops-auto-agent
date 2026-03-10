@@ -473,9 +473,22 @@ class Orchestrator:
 
                 # ── S3 403: wrong bucket — update secret + patch .tf, skip AI ──
                 combined_log = analysis.get("log_context", "") + analysis.get("full_log", "")
-                if ("403" in combined_log or "AccessDenied" in combined_log or "Access Denied" in combined_log) and ("tfstate" in combined_log.lower() or "ListObjects" in combined_log or "HeadObject" in combined_log):
+                _s3_issue = (
+                    ("403" in combined_log or "AccessDenied" in combined_log or "Access Denied" in combined_log)
+                    and ("tfstate" in combined_log.lower() or "ListObjects" in combined_log or "HeadObject" in combined_log)
+                ) or (
+                    ("NoSuchBucket" in combined_log or "does not exist" in combined_log)
+                    and ("tfstate" in combined_log.lower() or "S3 bucket" in combined_log or "backend" in combined_log.lower())
+                )
+                if _s3_issue:
                     correct_bucket = aws_agent.get_state_bucket_name()
-                    await cb(f"S3 403 detected — wrong bucket in secret. Updating TF_STATE_BUCKET → {correct_bucket}")
+                    # Ensure the bucket actually exists in AWS
+                    bucket_result = aws_agent.ensure_s3_bucket(correct_bucket)
+                    if bucket_result.get("created"):
+                        await cb(f"✓ Created missing S3 bucket: {correct_bucket}")
+                    elif bucket_result.get("error"):
+                        await cb(f"⚠️ S3 bucket error: {bucket_result['error']}")
+                    await cb(f"S3 bucket issue detected — ensuring TF_STATE_BUCKET secret = {correct_bucket}")
                     # Update the secret so pipeline uses the right bucket on retry
                     github_agent.set_secrets(repo_name, {"TF_STATE_BUCKET": correct_bucket})
                     # Also clean any hardcoded bucket from .tf files
@@ -727,6 +740,7 @@ class Orchestrator:
                     interval=30,
                     stop_flag=lambda: self.is_stopped(user_id),
                     progress_cb=cb,
+                    expected_run_id=trigger.get("run_id"),
                 )
 
                 if pipeline.get("status") == "stopped":
@@ -765,9 +779,19 @@ class Orchestrator:
                 combined_log = " ".join(
                     j.get("log", "") for j in pipeline.get("all_jobs", [])
                 )
-                if ("403" in combined_log or "AccessDenied" in combined_log or "Access Denied" in combined_log) and ("tfstate" in combined_log.lower() or "ListObjects" in combined_log or "HeadObject" in combined_log):
+                _s3_issue_d = (
+                    ("403" in combined_log or "AccessDenied" in combined_log or "Access Denied" in combined_log)
+                    and ("tfstate" in combined_log.lower() or "ListObjects" in combined_log or "HeadObject" in combined_log)
+                ) or (
+                    ("NoSuchBucket" in combined_log or "does not exist" in combined_log)
+                    and ("tfstate" in combined_log.lower() or "S3 bucket" in combined_log or "backend" in combined_log.lower())
+                )
+                if _s3_issue_d:
                     correct_bucket = aws_agent.get_state_bucket_name()
-                    await cb(f"S3 403 detected — updating TF_STATE_BUCKET secret → {correct_bucket}")
+                    bucket_result = aws_agent.ensure_s3_bucket(correct_bucket)
+                    if bucket_result.get("created"):
+                        await cb(f"✓ Created missing S3 bucket: {correct_bucket}")
+                    await cb(f"S3 bucket issue detected — updating TF_STATE_BUCKET secret → {correct_bucket}")
                     # Update secret so pipeline uses correct bucket on retry
                     github_agent.set_secrets(repo_name, {"TF_STATE_BUCKET": correct_bucket})
                     # Clean any hardcoded bucket from .tf files
@@ -780,6 +804,20 @@ class Orchestrator:
                                 branch=deploy_branch,
                             )
                             await cb(f"Patched {path}")
+                    await asyncio.sleep(3)
+                    continue
+
+                # ── Undeclared variable intercept ────────────────────────────
+                # If destroy.yml passes -var flags for variables not in main.tf,
+                # terraform destroy fails. Fix: regenerate destroy.yml with no -var flags.
+                if "Value for undeclared variable" in combined_log or                    ("undeclared variable" in combined_log.lower() and "terraform destroy" in combined_log.lower()):
+                    await cb("Destroy.yml passing invalid -var flags — regenerating without vars...")
+                    new_destroy = code_agent._gen_destroy(project, region, target)
+                    github_agent.push_single_file(
+                        repo_name, ".github/workflows/destroy.yml", new_destroy,
+                        f"fix: regenerate destroy.yml without -var flags (attempt {retry})",
+                        branch=deploy_branch,
+                    )
                     await asyncio.sleep(3)
                     continue
 

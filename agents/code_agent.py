@@ -163,10 +163,18 @@ class CodeAgent:
         """
         Fully dynamic — AI plans everything, then generates each file.
         Returns {path: content} — ONLY files that need to be pushed.
+        destroy.yml is ALWAYS regenerated — never trusted to the AI planner.
         """
         existing_files = existing_files or {}
         plan           = self.plan_deployment(project, app, region, target, existing_files)
         to_generate    = plan["update"] + plan["create"]
+
+        # ALWAYS regenerate destroy.yml — AI planner frequently skips it
+        # by marking it KEEP even when it doesn't exist in the repo
+        destroy_path = ".github/workflows/destroy.yml"
+        if destroy_path not in to_generate:
+            logger.info("destroy.yml not in plan — forcing regeneration")
+            to_generate.append(destroy_path)
 
         if not to_generate:
             logger.info("Nothing to generate — all files up to date")
@@ -237,23 +245,45 @@ class CodeAgent:
             + "CRITICAL INSTRUCTIONS:\n"
             + _target_instructions(target, path)
             + "\n- Return ONLY the file content, no explanation, no markdown fences"
+            + (
+                "\nCRITICAL S3 BUCKET RULE (deploy.yml): NEVER use '|| true' or '2>/dev/null' on bucket creation.\n"
+                "The create-bucket step MUST: (1) check if bucket exists first, (2) create if not, "
+                "(3) wait in a loop and confirm with head-bucket, (4) exit 1 if not ready after 60s.\n"
+                "Silent failures cause terraform init to fail with 'S3 bucket does not exist'.\n"
+                if ".github" in path and "deploy" in path else ""
+            )
         )
 
         return _strip_fences(_ask(prompt))
 
     def _gen_destroy(self, project: str, region: str, target: str = "ec2") -> str:
+        # Only pass -var flags for variables that actually exist in main.tf
+        # ec2/ec2-docker need public_key; ecs does not
+        var_flags = (
+            f"-var=\"public_key=placeholder\" "
+            f"-var=\"project_name=${{{{ secrets.PROJECT_NAME }}}}\" "
+            f"-var=\"aws_region=${{{{ secrets.AWS_REGION }}}}\"" 
+            if target != "ecs"
+            else
+            f"-var=\"project_name=${{{{ secrets.PROJECT_NAME }}}}\" "
+            f"-var=\"aws_region=${{{{ secrets.AWS_REGION }}}}\"" 
+        )
         prompt = (
             f"Generate a GitHub Actions destroy.yml for project \"{project}\".\n"
+            f"- workflow_dispatch trigger only (never push)\n"
             f"- Terraform destroy with S3 backend\n"
-            f"- Use -backend-config=\"bucket=${{{{ secrets.TF_STATE_BUCKET }}}}\" "
-            f"-backend-config=\"region=${{{{ secrets.AWS_REGION }}}}\" at terraform init\n"
-            f"- State key: {project}/terraform.tfstate\n"
-            f"- Vars: -var=\"public_key=placeholder\" "
-            f"-var=\"project_name=${{{{ secrets.PROJECT_NAME }}}}\" "
-            f"-var=\"aws_region=${{{{ secrets.AWS_REGION }}}}\"\n"
-            f"- Add || true after destroy\n"
-            f"- Secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, "
-            f"SSH_PUBLIC_KEY, PROJECT_NAME, TF_STATE_BUCKET\n"
+            f"- terraform init with:\n"
+            f"  -backend-config=\"bucket=${{{{ secrets.TF_STATE_BUCKET }}}}\"\n"
+            f"  -backend-config=\"region=${{{{ secrets.AWS_REGION }}}}\"\n"
+            f"  -backend-config=\"key={project}/terraform.tfstate\"\n"
+            f"- terraform destroy step: use ONLY -auto-approve. NO -var flags whatsoever.\n"
+            f"  Reason: terraform destroy reads existing state — it does not need input variables.\n"
+            f"  Passing -var flags for variables not declared in main.tf causes destroy to FAIL.\n"
+            f"  The correct command is exactly: terraform destroy -auto-approve\n"
+            f"- CRITICAL: Do NOT add || true after terraform destroy.\n"
+            f"  The pipeline must fail visibly if destroy fails.\n"
+            f"  Only || true is acceptable on cleanup steps like: aws ec2 delete-key-pair, aws ec2 delete-security-group\n"
+            f"- Secrets needed: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, PROJECT_NAME, TF_STATE_BUCKET\n"
             f"Return ONLY the YAML, no explanation, no markdown fences."
         )
         return _strip_fences(_ask(prompt))
@@ -306,7 +336,32 @@ class CodeAgent:
             f"Jobs: provision→configure→verify→notify\n"
             f"CRITICAL: Output the COMPLETE file — do not truncate or cut off mid-block.\n"
             f"The file must end with a complete YAML step. Never end mid-run block.\n"
-            f"Follow ALL rules below. Return ONLY YAML, no fences.\n\n{skill}"
+            f"Follow ALL rules below. Return ONLY YAML, no fences.\n\n{skill}\n\n"
+            f"CRITICAL TRIGGER RULE:\n"
+            f"The deploy.yml on.push trigger MUST include paths-ignore for README.md.\n"
+            f"The first job MUST have an if: condition that skips commits starting with:\n"
+            f"  'fix:', 'Fix destroy', 'docs:', 'chore:'\n"
+            f"Without this, every fix commit pushed during destroy triggers a new deploy.\n"
+            f"Example:\n"
+            f"  if: |\n"
+            f"    !contains(github.event.head_commit.message, 'fix:') &&\n"
+            f"    !contains(github.event.head_commit.message, 'Fix destroy') &&\n"
+            f"    !contains(github.event.head_commit.message, 'docs: update README') &&\n"
+            f"    !startsWith(github.event.head_commit.message, 'chore:')\n"
+            f"CRITICAL S3 BUCKET RULE:\n"
+            f"The S3 bucket creation step MUST use this exact pattern — no || true, no 2>/dev/null:\n"
+            f"  if aws s3api head-bucket --bucket \"${{{{ secrets.TF_STATE_BUCKET }}}}\" --region \"${{{{ secrets.AWS_REGION }}}}\" 2>/dev/null; then\n"
+            f"    echo Bucket exists; exit 0\n"
+            f"  fi\n"
+            f"  if [ \"${{{{ secrets.AWS_REGION }}}}\" = \"us-east-1\" ]; then\n"
+            f"    aws s3api create-bucket --bucket \"${{{{ secrets.TF_STATE_BUCKET }}}}\" --region \"${{{{ secrets.AWS_REGION }}}}\"\n"
+            f"  else\n"
+            f"    aws s3api create-bucket --bucket \"${{{{ secrets.TF_STATE_BUCKET }}}}\" --region \"${{{{ secrets.AWS_REGION }}}}\" --create-bucket-configuration LocationConstraint=\"${{{{ secrets.AWS_REGION }}}}\"\n"
+            f"  fi\n"
+            f"  for i in $(seq 1 12); do\n"
+            f"    aws s3api head-bucket --bucket \"${{{{ secrets.TF_STATE_BUCKET }}}}\" 2>/dev/null && exit 0 || sleep 5\n"
+            f"  done\n"
+            f"  exit 1  # fail hard if bucket not ready\n"
         )
         for attempt in range(3):
             result = _strip_fences(_ask(prompt))

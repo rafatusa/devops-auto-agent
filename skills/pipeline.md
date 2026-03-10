@@ -1,5 +1,32 @@
 # GitHub Actions Pipeline Best Practices
 
+## CRITICAL: Pipeline triggers — deploy.yml must NEVER run on fix/destroy commits
+
+```yaml
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'README.md'       # bot updates README on every deploy — don't retrigger
+      - '.gitignore'
+  workflow_dispatch:      # always allow manual trigger
+
+# Prevent deploy from running when destroy pushes a fix commit
+# by filtering commit messages in the first job:
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    # Skip if commit message contains fix:, destroy, docs:, chore:
+    if: |
+      !contains(github.event.head_commit.message, 'Fix destroy') &&
+      !contains(github.event.head_commit.message, 'fix: clean') &&
+      !contains(github.event.head_commit.message, 'fix: update terraform backend for destroy') &&
+      !contains(github.event.head_commit.message, 'docs: update README') &&
+      !startsWith(github.event.head_commit.message, 'chore:')
+```
+
+**Rule: ALWAYS add the `if:` guard on the first job. Without it, every fix commit pushed during destroy triggers a new deploy.**
+
 ## Structure — always these jobs in order
 1. provision  — terraform (skip if EC2 exists)
 2. configure  — ansible
@@ -76,11 +103,46 @@
 
 ## S3 bucket creation — before terraform init
 Always use secrets.TF_STATE_BUCKET and secrets.AWS_REGION — never hardcode bucket name or region.
+
+CRITICAL: Never use `|| true` or `2>/dev/null` on bucket creation — silent failures cause terraform init to fail.
+The bucket MUST exist and be confirmed before terraform init runs.
+
 ```yaml
 - name: Create S3 state bucket
   if: steps.check_ec2.outputs.exists != 'true'
-  run: aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+  run: |
+    BUCKET="${{ secrets.TF_STATE_BUCKET }}"
+    REGION="${{ secrets.AWS_REGION }}"
+
+    # Check if bucket already exists
+    if aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" 2>/dev/null; then
+      echo "✅ Bucket already exists: $BUCKET"
+      exit 0
+    fi
+
+    echo "Creating bucket: $BUCKET in $REGION"
+    if [ "$REGION" = "us-east-1" ]; then
+      aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
+    else
+      aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"         --create-bucket-configuration LocationConstraint="$REGION"
+    fi
+
+    # Wait and confirm — do NOT proceed if bucket doesn't exist
+    echo "Waiting for bucket to be ready..."
+    for i in $(seq 1 12); do
+      if aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" 2>/dev/null; then
+        echo "✅ Bucket ready: $BUCKET"
+        exit 0
+      fi
+      echo "  attempt $i/12 — waiting 5s..."
+      sleep 5
+    done
+
+    echo "❌ Bucket not ready after 60s — aborting"
+    exit 1
 ```
+
+**Rule: Always `exit 1` if bucket creation fails — never swallow the error with `|| true`. Terraform init WILL fail if the bucket doesn't exist.**
 
 ## Secrets always needed
 - AWS_ACCESS_KEY_ID
@@ -132,3 +194,29 @@ concurrency:
     [ "$SG" != "None" ] && terraform import -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" aws_security_group.sg "$SG" 2>/dev/null || true
   working-directory: terraform
 ```
+
+## destroy.yml — critical rules
+
+**terraform destroy does NOT need -var flags.** It reads existing state. Passing vars not declared in main.tf causes destroy to fail immediately.
+
+```yaml
+# CORRECT
+- name: Terraform destroy
+  run: terraform destroy -auto-approve
+
+# WRONG — causes "Value for undeclared variable" error
+- name: Terraform destroy
+  run: terraform destroy -auto-approve -var="public_key=placeholder" -var="project_name=..."
+```
+
+**Never use `|| true` after `terraform destroy`** — it hides real failures and reports success to the bot even when resources were NOT destroyed.
+
+```yaml
+# CORRECT — fail visibly
+- run: terraform destroy -auto-approve
+
+# WRONG — hides failures
+- run: terraform destroy -auto-approve || true
+```
+
+**destroy.yml trigger must be `workflow_dispatch` only** — never `on: push`. Destroy should never run automatically.

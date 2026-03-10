@@ -213,15 +213,55 @@ class GitHubAgent:
 
     def trigger_pipeline(self, repo_name: str, workflow: str = "deploy.yml",
                          branch: str = "main") -> dict:
+        import time
         try:
             repo = self._user().get_repo(repo_name)
+
+            # Record latest run_id BEFORE triggering so we can confirm a NEW run starts
             try:
-                repo.get_workflow(workflow).create_dispatch(branch)
+                existing_runs = list(repo.get_workflow_runs())
+                latest_run_id_before = existing_runs[0].id if existing_runs else None
             except Exception:
+                latest_run_id_before = None
+
+            # Try to find and trigger the workflow
+            triggered = False
+            try:
+                wf = repo.get_workflow(workflow)
+                wf.create_dispatch(branch)
+                triggered = True
+            except Exception:
+                # Fallback: search by path suffix
                 for wf in repo.get_workflows():
                     if wf.path.endswith(workflow):
                         wf.create_dispatch(branch)
+                        triggered = True
                         break
+
+            if not triggered:
+                return {
+                    "status": "error",
+                    "error": f"Workflow '{workflow}' not found in repo '{repo_name}'. "
+                             f"The file may not have been pushed yet."
+                }
+
+            # Wait up to 15s for a NEW run to appear (confirms dispatch worked)
+            for _ in range(5):
+                time.sleep(3)
+                try:
+                    new_runs = list(repo.get_workflow_runs())
+                    if new_runs and new_runs[0].id != latest_run_id_before:
+                        return {
+                            "status":   "triggered",
+                            "workflow": workflow,
+                            "branch":   branch,
+                            "run_id":   new_runs[0].id,
+                            "url":      f"https://github.com/{self.username}/{repo_name}/actions",
+                        }
+                except Exception:
+                    pass
+
+            # Dispatch sent but no new run visible yet — still return triggered
             return {
                 "status":   "triggered",
                 "workflow": workflow,
@@ -318,7 +358,10 @@ class GitHubAgent:
 
     async def poll_pipeline(self, repo_name: str, interval: int = 30,
                             max_wait: int = 1800, branch: str = None,
-                            stop_flag=None, progress_cb=None) -> dict:
+                            stop_flag=None, progress_cb=None,
+                            expected_run_id: int = None) -> dict:
+        """Poll until pipeline completes. If expected_run_id given, only return
+        that specific run — prevents picking up stale completed runs."""
         import asyncio
         waited = 0
         while waited < max_wait:
@@ -326,6 +369,13 @@ class GitHubAgent:
             await asyncio.sleep(interval)
             waited += interval
             status = self.get_pipeline_status(repo_name, branch=branch)
+
+            # If we're watching a specific run, skip until it appears
+            if expected_run_id and status.get("run_id") != expected_run_id:
+                if progress_cb:
+                    await progress_cb(f"Waiting for run #{expected_run_id} to start...")
+                continue
+
             if progress_cb:
                 await progress_cb(f"Pipeline: {status.get('status')} / {status.get('conclusion','...')}")
             if status.get("status") == "completed":
