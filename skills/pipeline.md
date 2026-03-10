@@ -36,7 +36,12 @@
 
 - name: Terraform Plan
   if: steps.check_ec2.outputs.exists != 'true'
-  run: terraform plan -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" -out=tfplan
+  run: |
+    terraform plan \
+      -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+      -var="project_name=${{ secrets.PROJECT_NAME }}" \
+      -var="aws_region=${{ secrets.AWS_REGION }}" \
+      -out=tfplan
   working-directory: terraform
 
 - name: Terraform Apply

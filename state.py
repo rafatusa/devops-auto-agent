@@ -28,6 +28,7 @@ def init_db():
             repo        TEXT,
             cloud       TEXT DEFAULT 'AWS',
             region      TEXT DEFAULT 'us-east-1',
+            branch      TEXT DEFAULT 'main',
             status      TEXT DEFAULT 'pending',
             ec2_ip      TEXT,
             created_at  TEXT,
@@ -53,15 +54,15 @@ def init_db():
         """)
 
 
-def save_deployment(project, app, repo, cloud="AWS", region="us-east-1"):
+def save_deployment(project, app, repo, cloud="AWS", region="us-east-1", branch="main"):
     now = datetime.utcnow().isoformat()
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO deployments (project,app,repo,cloud,region,status,created_at,updated_at) "
-            "VALUES (?,?,?,?,?,'pending',?,?) "
+            "INSERT INTO deployments (project,app,repo,cloud,region,branch,status,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,'pending',?,?) "
             "ON CONFLICT(project) DO UPDATE SET app=excluded.app, repo=excluded.repo, "
-            "cloud=excluded.cloud, region=excluded.region, updated_at=excluded.updated_at",
-            (project, app, repo, cloud, region, now, now)
+            "cloud=excluded.cloud, region=excluded.region, branch=excluded.branch, updated_at=excluded.updated_at",
+            (project, app, repo, cloud, region, branch, now, now)
         )
 
 

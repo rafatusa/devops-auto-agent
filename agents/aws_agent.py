@@ -168,19 +168,30 @@ class AWSAgent:
             s3 = self._s3()
             try:
                 s3.head_bucket(Bucket=bucket)
+                # Bucket exists and we can access it — nothing to do
                 return {"exists": True, "bucket": bucket}
-            except Exception:
-                if self.region == "us-east-1":
-                    s3.create_bucket(Bucket=bucket)
-                else:
-                    s3.create_bucket(
-                        Bucket=bucket,
-                        CreateBucketConfiguration={"LocationConstraint": self.region}
-                    )
-                logger.info(f"Created S3 bucket: {bucket}")
-                return {"created": True, "bucket": bucket}
+            except s3.exceptions.ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("403", "BucketAlreadyOwnedByYou"):
+                    # Bucket exists (owned by us or accessible) — skip creation
+                    return {"exists": True, "bucket": bucket}
+                if code == "404":
+                    # Bucket does not exist — create it
+                    if self.region == "us-east-1":
+                        s3.create_bucket(Bucket=bucket)
+                    else:
+                        s3.create_bucket(
+                            Bucket=bucket,
+                            CreateBucketConfiguration={"LocationConstraint": self.region}
+                        )
+                    logger.info(f"Created S3 bucket: {bucket}")
+                    return {"created": True, "bucket": bucket}
+                # Any other error — log warning but don't crash the deploy
+                logger.warning(f"ensure_s3_bucket: unexpected error checking {bucket}: {e}")
+                return {"warning": str(e), "bucket": bucket}
         except Exception as e:
-            return {"error": str(e)}
+            logger.warning(f"ensure_s3_bucket: {e}")
+            return {"warning": str(e), "bucket": bucket}
 
     def delete_s3_state(self, project: str, bucket: str = None) -> dict:
         """Delete terraform state from S3."""

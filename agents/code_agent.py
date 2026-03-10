@@ -22,7 +22,7 @@ def _claude():
 def _ask(prompt: str, system: str = None) -> str:
     kwargs = dict(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     )
     if system:
@@ -300,14 +300,25 @@ class CodeAgent:
                      pipeline_type: str = "deploy") -> str:
         if pipeline_type == "destroy":
             return self._gen_destroy(project, region)
-        skill   = load_skills("pipeline", "terraform-aws", "ansible")
-        content = _strip_fences(_ask(
-            f"Generate deploy.yml for project \"{project}\" in \"{region}\".\n"
+        skill = load_skills("pipeline", "terraform-aws", "ansible")
+        prompt = (
+            f"Generate a complete deploy.yml for project \"{project}\" in \"{region}\".\n"
             f"Jobs: provision→configure→verify→notify\n"
-            f"Follow ALL rules below.\nReturn ONLY YAML, no fences.\n\n{skill}"
-        ))
-        if project: state.save_file(project, ".github/workflows/deploy.yml", content)
-        return content
+            f"CRITICAL: Output the COMPLETE file — do not truncate or cut off mid-block.\n"
+            f"The file must end with a complete YAML step. Never end mid-run block.\n"
+            f"Follow ALL rules below. Return ONLY YAML, no fences.\n\n{skill}"
+        )
+        for attempt in range(3):
+            result = _strip_fences(_ask(prompt))
+            # Validate — reject if truncated (ends mid-block or very short)
+            lines = result.strip().splitlines()
+            last  = lines[-1].strip() if lines else ""
+            if len(lines) > 20 and last not in ("", "|") and not last.endswith(("run", "run: |")):
+                break
+            logger.warning(f"gen_pipeline: output appears truncated (attempt {attempt+1}), retrying")
+        if project:
+            state.save_file(project, ".github/workflows/deploy.yml", result)
+        return result
 
     # ── Fix file ──────────────────────────────────────────────────────────────
 
@@ -337,49 +348,54 @@ class CodeAgent:
         # Smart log slicing — include ALL job sections
         # Split by job sections and include every section (truncated if huge)
         log_sections = _split_job_sections(log_context)
-        log_slice    = _build_log_slice(log_sections, max_chars=8000)
+        log_slice    = _build_log_slice(log_sections, max_chars=12000)
 
         resp = _ask(
-            f"A GitHub Actions deployment pipeline failed. Find ALL broken files and fix them.\n\n"
+            f"A GitHub Actions deployment pipeline failed.\n\n"
 
-            f"=== PIPELINE LOG (every job section — read ALL of them) ===\n"
+            f"=== STEP 1 — READ THE LOG FIRST ===\n"
+            f"The pipeline log below contains the ACTUAL error from GitHub Actions.\n"
+            f"Read it carefully before looking at any files.\n"
+            f"The log is ground truth — do NOT infer errors from file content alone.\n\n"
+
+            f"=== PIPELINE LOG ===\n"
             f"{log_slice}\n\n"
 
-            f"=== ALL DEPLOYMENT FILES (live from repo) ===\n"
-            f"{all_files_text[:5000]}\n\n"
+            f"=== STEP 2 — READ THE FILES ===\n"
+            f"These are the live files from the repo. Only change what the log error points to.\n\n"
+            f"{all_files_text}\n\n"
 
-            f"=== BEST PRACTICES REFERENCE ===\n"
-            f"{skills[:1500]}\n\n"
+            f"=== STEP 3 — FIX RULES ===\n"
+            f"GOLDEN RULE: Change THE MINIMUM number of lines needed to fix the error from the log.\n"
+            f"Do NOT restructure, reformat, reorder, or rewrite anything the log does not complain about.\n"
+            f"If the log shows one broken line — fix only that line. Leave everything else identical.\n\n"
 
-            f"=== YOUR TASK ===\n"
-            f"Read every job section in the log above — [FAILED] and [passed] both.\n\n"
+            f"CRITICAL — DO NOT DO THESE:\n"
+            f"  - Do NOT rewrite a file because it looks incomplete or ugly\n"
+            f"  - Do NOT add or remove steps the log did not complain about\n"
+            f"  - Do NOT change a file if the log error is in a DIFFERENT file\n"
+            f"  - Do NOT guess the error — quote it exactly from the log in the ERROR: field\n\n"
 
-            f"GOLDEN RULE: Change THE MINIMUM number of lines needed to fix the error.\n"
-            f"Do NOT restructure, reformat, reorder, or rewrite working sections.\n"
-            f"If the fix is one line — change only that one line. Keep everything else identical.\n\n"
+            f"KNOWN PATTERNS — fix EXACTLY as described:\n"
+            f"  1. 'Could not match supplied host pattern' / 'no hosts matched'\n"
+            f"     → Change ONLY: hosts: X → hosts: all. Nothing else.\n\n"
+            f"  2. 'Could not find or access src path on Ansible Controller'\n"
+            f"     → Replace ONLY that copy task src: with content: | inline. Nothing else.\n\n"
+            f"  3. 'Colons in unquoted values' at line N\n"
+            f"     → Quote only that value on line N. Nothing else.\n\n"
+            f"  4. S3 403 / bucket access error\n"
+            f"     → This is NOT a file error. Do not touch any file. Output nothing.\n\n"
+            f"  5. Any other error — quote the exact error line, fix only the line it points to.\n\n"
 
-            f"KNOWN ERROR PATTERNS — fix EXACTLY as described, nothing more:\n"
-            f"  1. 'Could not match supplied host pattern, ignoring: X' or 'skipping: no hosts matched'\n"
-            f"     → ONE change only: find the line 'hosts: X' and change it to 'hosts: all'\n"
-            f"     → Do NOT change gather_facts, vars, tasks, or anything else\n"
-            f"     → The rest of the playbook is working — leave it exactly as-is\n\n"
-            f"  2. 'Could not find or access \'../<path>/\' on the Ansible Controller'\n"
-            f"     → The copy module has a src: path that doesn't exist in the repo\n"
-            f"     → Replace ONLY that copy task's src: line with content: | and inline content\n"
-            f"     → Do NOT change other tasks\n\n"
-            f"  3. 'Colons in unquoted values' at line N column C\n"
-            f"     → Find line N in the file. Quote only that value with double quotes\n"
-            f"     → Change nothing else\n\n"
-            f"  4. Any other error — find the exact broken line from the log, fix only that line\n\n"
-
-            f"OUTPUT FORMAT — for each broken file:\n"
+            f"OUTPUT FORMAT:\n"
             f"FILE: <exact path>\n"
-            f"ERROR: <exact quote from log>\n"
+            f"ERROR: <exact error message copied from the log>\n"
             f"FIXED_CONTENT:\n"
-            f"<the complete file — every line — with only the broken line(s) changed>\n"
+            f"<complete file with ONLY the broken lines changed>\n"
             f"END_FIXED_CONTENT\n\n"
 
-            f"Multiple files? Output multiple FILE blocks.\n"
+            f"Multiple broken files? Output one FILE block per file.\n"
+            f"If the error is NOT a file problem (e.g. S3 403, missing secret, network): output nothing.\n"
             f"No text before FILE: or after END_FIXED_CONTENT.\n"
         )
 

@@ -143,3 +143,27 @@ The GitHub Actions runner only has files that are committed to the repo.
 - Ansible runs from the `ansible/` directory
 - `../html/` means the `html/` folder at repo root — must exist in repo
 - `../app/` means the `app/` folder at repo root — must exist in repo
+
+## CRITICAL: become_user vs become: yes
+```yaml
+# become: yes  → run task as ROOT (needed for apt, systemd, file permissions)
+# become_user: ubuntu → run task as a specific non-root user (e.g. PM2, app startup)
+
+# WRONG — become_user alone does not grant sudo, causes permission errors
+- name: Start app
+  shell: pm2 start app.js
+  become_user: ubuntu         # ← alone this is not sufficient
+
+# CORRECT — use become: yes at play level, become_user only for user-specific tasks
+- name: Start app with PM2
+  shell: pm2 start app.js --name app
+  become: yes
+  become_user: ubuntu         # ← with become:yes this runs as ubuntu via sudo
+
+# CORRECT — for system tasks always just become: yes (runs as root)
+- name: Install nginx
+  apt:
+    name: nginx
+  become: yes
+```
+**Rule: Set `become: yes` at play level for all system tasks. Only add `become_user` when running a command as a specific non-root user (e.g. PM2 under ubuntu).**

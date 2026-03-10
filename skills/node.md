@@ -97,3 +97,36 @@
 - Use PM2 for process management
 - App files go in /opt/app/
 - Always install Node 20.x LTS
+
+## CRITICAL: Copy app files — src path must exist in repo
+
+The `src: app/` path only works if there is an `app/` folder committed in the repo root.
+If the repo has no `app/` folder, this task will fail with "Could not find or access".
+
+### Preferred approach — clone/pull from GitHub on the remote server:
+```yaml
+- name: Pull app from repo
+  git:
+    repo: "https://github.com/{{ lookup('env', 'GITHUB_REPOSITORY') }}.git"
+    dest: "{{ app_dir }}"
+    version: HEAD
+    force: yes
+  environment:
+    GIT_TERMINAL_PROMPT: "0"
+```
+
+### Alternative — write app inline with content: |
+```yaml
+- name: Write server.js
+  copy:
+    content: |
+      const http = require('http');
+      const server = http.createServer((req, res) => {
+        res.writeHead(200);
+        res.end('Hello from Node.js');
+      });
+      server.listen(3000);
+    dest: "{{ app_dir }}/index.js"
+```
+
+**Rule: Never use `src: app/` unless an `app/` folder is actually committed in the repo.**

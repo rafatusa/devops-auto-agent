@@ -100,3 +100,47 @@
 - Virtualenv in /opt/app/venv
 - Systemd manages the process
 - Main app file should be main.py with app = Flask(__name__) or FastAPI()
+
+## CRITICAL: Copy app files — src path must exist in repo
+
+The `src: app/` path only works if there is an `app/` folder committed in the repo root.
+If the repo has no `app/` folder, this task will fail with "Could not find or access".
+
+### Preferred approach — clone/pull from GitHub on the remote server:
+```yaml
+- name: Pull app from repo
+  git:
+    repo: "https://github.com/{{ lookup('env', 'GITHUB_REPOSITORY') }}.git"
+    dest: "{{ app_dir }}"
+    version: HEAD
+    force: yes
+  environment:
+    GIT_TERMINAL_PROMPT: "0"
+```
+
+### Alternative — write app files inline:
+```yaml
+- name: Write main.py
+  copy:
+    content: |
+      from fastapi import FastAPI
+      app = FastAPI()
+
+      @app.get("/")
+      def root():
+          return {"status": "ok"}
+    dest: "{{ app_dir }}/main.py"
+```
+
+### Also write requirements.txt inline if not in repo:
+```yaml
+- name: Write requirements.txt
+  copy:
+    content: |
+      fastapi
+      uvicorn
+      gunicorn
+    dest: "{{ app_dir }}/requirements.txt"
+```
+
+**Rule: Never use `src: app/` unless an `app/` folder is actually committed in the repo.**

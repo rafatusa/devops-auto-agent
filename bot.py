@@ -1043,8 +1043,38 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Destroy flow ──────────────────────────────────────────────────────────
     if mode == "destroy_project":
         project = text.strip()
-        sessions[uid] = {"mode": "destroy_confirm", "answers": {"project": project}}
-        await update.message.reply_text(f"Destroy {project}? Also delete GitHub repo? (yes / yes+repo / no)")
+        # Show available branches so user can pick the right one
+        dep  = state.get_deployment(project) or {}
+        repo = dep.get("repo", project)
+        try:
+            branches_result = github_agent.list_branches(repo)
+            branches = [b for b in branches_result.get("branches", []) if b != "main"]
+        except Exception:
+            branches = []
+
+        sessions[uid] = {"mode": "destroy_branch", "answers": {"project": project, "repo": repo}}
+        if branches:
+            branch_list = "\n".join(f"  • {b}" for b in branches)
+            await update.message.reply_text(
+                f"Which branch to destroy for '{project}'?\n\n"
+                f"Available branches:\n{branch_list}\n\n"
+                f"Type the branch name (or 'main'):"
+            )
+        else:
+            await update.message.reply_text(
+                f"Which branch to destroy for '{project}'?\n"
+                f"(e.g. feature/ec2, main)"
+            )
+        return
+
+    if mode == "destroy_branch":
+        answers = sess["answers"]
+        answers["branch"] = text.strip()
+        sessions[uid] = {"mode": "destroy_confirm", "answers": answers}
+        await update.message.reply_text(
+            f"Destroy '{answers['project']}' on branch '{answers['branch']}'?\n"
+            f"Also delete GitHub repo? (yes / yes+repo / no)"
+        )
         return
 
     if mode == "destroy_confirm":
@@ -1353,6 +1383,7 @@ async def _run_destroy(update, uid, answers):
         repo = dep.get("repo", answers["project"]) if dep else answers["project"]
         result = await orchestrator.destroy(
             user_id=uid, project=answers["project"], repo_name=repo,
+            branch=answers.get("branch", "main"),
             delete_repo=answers.get("del_repo","no").lower()=="yes", progress_cb=cb,
         )
         project = answers["project"]

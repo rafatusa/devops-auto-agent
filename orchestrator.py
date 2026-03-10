@@ -13,6 +13,45 @@ from agents.github_agent import github_agent
 from agents.code_agent   import code_agent
 from agents.error_agent  import error_agent
 
+def _get_deploy_branch(project: str, repo_name: str) -> str:
+    """
+    Find which branch has the deployed terraform files for this project.
+    Checks state DB first, then scans repo branches for terraform files.
+    Always returns a branch — defaults to main if nothing found.
+    """
+    # Check state DB for saved branch
+    try:
+        dep    = state.get_deployment(project) or {}
+        branch = dep.get("branch")
+        if branch and branch != "main":
+            return branch
+    except Exception:
+        pass
+
+    # Scan repo branches — find one with terraform files (not main)
+    try:
+        branches_result = github_agent.list_branches(repo_name)
+        # list_branches returns dict or list depending on version
+        if isinstance(branches_result, dict):
+            branch_names = branches_result.get("branches", [])
+        else:
+            branch_names = branches_result or []
+
+        for b in branch_names:
+            b_name = b if isinstance(b, str) else b.get("name", "")
+            if not b_name or b_name == "main":
+                continue
+            files = github_agent.get_existing_files(repo_name, branch=b_name)
+            if any(f.endswith(".tf") for f in files):
+                logger.info(f"_get_deploy_branch: found terraform on branch '{b_name}'")
+                return b_name
+    except Exception as e:
+        logger.warning(f"_get_deploy_branch: branch scan failed: {e}")
+
+    logger.warning(f"_get_deploy_branch: no non-main branch found for {project}, using main")
+    return "main"
+
+
 def _patch_terraform_bucket(files: dict, correct_bucket: str, correct_region: str) -> None:
     """
     Bucket and region are passed via -backend-config flags at terraform init time.
@@ -43,37 +82,78 @@ def _patch_terraform_bucket(files: dict, correct_bucket: str, correct_region: st
 
 
 def _extract_display_error(raw_log: str) -> str:
-    """Extract a clean error summary from raw combined job log for display."""
+    """
+    Extract the actual error lines from a pipeline log for display in Telegram.
+    Strips timestamps and GitHub Actions noise. Returns up to 3 meaningful error lines.
+    """
     import re
     if not raw_log:
         return "Unknown error"
-    patterns = [
-        r"(?i)fatal:.*",
-        r"(?i)error:.*process completed.*",
-        r"(?i)could not find or access.*",
-        r"(?i)could not match supplied host.*",
-        r"(?i)skipping: no hosts matched",
-        r"(?i)permission denied.*",
-        r"(?i)no such file.*",
-    ]
+
     found = []
     for line in raw_log.splitlines():
+        # Strip timestamp prefix: 2024-01-01T00:00:00.000Z
+        s = re.sub(r"^\d{4}-\d{2}-\d{2}T[\d:.Z]+ *", "", line.strip())
+        # Strip GitHub Actions group markers: ##[error], ##[warning] etc
+        s = re.sub(r"^##\[.*?\] *", "", s).strip()
+        # Strip ANSI escape codes
+        s = re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+        if not s or s.startswith("===") or len(s) < 8:
+            continue
+        # Match any meaningful error/failure line
+        if re.search(r"(?i)(error:|fatal:|failed|access denied|permission denied|"
+                     r"no such file|could not|unable to|exit code [^0]|"
+                     r"statuscode: [45]\d\d|forbidden|unauthorized)", s):
+            clean = s[:300]
+            if clean not in found:
+                found.append(clean)
+        if len(found) >= 3:
+            break
+
+    if found:
+        return "\n".join(found)
+
+    # Fallback: last non-empty meaningful line
+    for line in reversed(raw_log.splitlines()):
         s = re.sub(r"^\d{4}-\d{2}-\d{2}T[\d:.Z]+ *", "", line.strip())
         s = re.sub(r"^##\[.*?\] *", "", s).strip()
-        if not s or s.startswith("==="):
-            continue
-        for pat in patterns:
-            if re.search(pat, s):
-                found.append(s[:200])
-                break
-        if len(found) >= 2:
-            break
-    if found:
-        return " | ".join(found)
-    for line in reversed(raw_log.splitlines()):
-        s = line.strip()
         if s and len(s) > 10 and "===" not in s:
             return s[:300]
+    return "Unknown error"
+
+
+def _extract_job_errors(all_jobs: list) -> list:
+    """
+    Return list of {job, step, error} for each failed job — for Telegram display.
+    """
+    import re
+    results = []
+    for job in all_jobs:
+        if job.get("conclusion") != "failure" and not job.get("failed_steps"):
+            continue
+        job_name    = job.get("name", "unknown")
+        failed_step = job.get("failed_steps", ["unknown step"])[0] if job.get("failed_steps") else "unknown step"
+        log         = job.get("log", "")
+        error_lines = []
+        for line in log.splitlines():
+            s = re.sub(r"^\d{4}-\d{2}-\d{2}T[\d:.Z]+ *", "", line.strip())
+            s = re.sub(r"^##\[.*?\] *", "", s).strip()
+            s = re.sub(r"\x1b\[[0-9;]*m", "", s)
+            if not s or len(s) < 8:
+                continue
+            if re.search(r"(?i)(error:|fatal:|failed|access denied|permission denied|"
+                         r"no such file|could not|unable to|exit code [^0]|"
+                         r"statuscode: [45]\d\d|forbidden|unauthorized)", s):
+                error_lines.append(s[:300])
+            if len(error_lines) >= 3:
+                break
+        results.append({
+            "job":   job_name,
+            "step":  failed_step,
+            "error": "\n".join(error_lines) or "No error text found",
+        })
+    return results
     return raw_log[:300]
 
 
@@ -125,7 +205,7 @@ class Orchestrator:
             state.log_step(project, name, "running")
 
         try:
-            state.save_deployment(project, app, repo_name, region=region)
+            state.save_deployment(project, app, repo_name, region=region, branch=branch)
 
             # ── Check if previously deployed successfully ──────────────────────
             dep = state.get_deployment(project)
@@ -260,14 +340,11 @@ class Orchestrator:
             # Ensure S3 terraform state bucket exists in THIS AWS account
             # Bucket name is auto-derived from account ID — different per account
             bucket_name = aws_agent.get_state_bucket_name()
-            await cb(f"Ensuring S3 state bucket '{bucket_name}' exists...")
             bucket_result = aws_agent.ensure_s3_bucket(bucket_name)
-            if bucket_result.get("status") == "created":
+            if bucket_result.get("created"):
                 await cb(f"✓ Created S3 bucket: {bucket_name}")
-            elif bucket_result.get("status") == "exists":
-                await cb(f"✓ S3 bucket ready: {bucket_name}")
-            else:
-                await cb(f"⚠️ S3 bucket warning: {bucket_result.get('error','unknown')}")
+            elif bucket_result.get("error"):
+                await cb(f"⚠️ S3 bucket error: {bucket_result['error']}")
 
             # Patch any terraform files in the branch that have a wrong/old bucket name
             # This handles the case where the branch was generated with a different account's bucket
@@ -372,8 +449,17 @@ class Orchestrator:
                     break
 
                 retry += 1
-                await cb(f"Pipeline failed — auto-fixing (attempt {retry}/{MAX_RETRIES})...")
-                await cb(f"Failed job: {analysis.get('job_name', 'unknown')}")
+
+                # Report exactly what failed and where — stage + error lines
+                job_errors = _extract_job_errors(pipeline.get("all_jobs", []))
+                for je in job_errors:
+                    await cb(
+                        f"❌ Stage: {je['job']}\n"
+                        f"   Step:  {je['step']}\n"
+                        f"   Error: {je['error']}"
+                    )
+
+                await cb(f"🔧 Auto-fixing (attempt {retry}/{MAX_RETRIES})...")
 
                 # Always read LIVE files from the actual branch — never trust local state
                 await cb(f"Reading current files from branch '{branch}'...")
@@ -384,6 +470,30 @@ class Orchestrator:
                     state.save_file(project, path, fcontent)
 
                 await cb(f"Analysing error against {len(repo_files_now)} live files...")
+
+                # ── S3 403: wrong bucket — update secret + patch .tf, skip AI ──
+                combined_log = analysis.get("log_context", "") + analysis.get("full_log", "")
+                if ("403" in combined_log or "AccessDenied" in combined_log or "Access Denied" in combined_log) and ("tfstate" in combined_log.lower() or "ListObjects" in combined_log or "HeadObject" in combined_log):
+                    correct_bucket = aws_agent.get_state_bucket_name()
+                    await cb(f"S3 403 detected — wrong bucket in secret. Updating TF_STATE_BUCKET → {correct_bucket}")
+                    # Update the secret so pipeline uses the right bucket on retry
+                    github_agent.set_secrets(repo_name, {"TF_STATE_BUCKET": correct_bucket})
+                    # Also clean any hardcoded bucket from .tf files
+                    _patch_terraform_bucket(repo_files_now, correct_bucket, region)
+                    for path, fc in repo_files_now.items():
+                        if path.endswith(".tf"):
+                            github_agent.push_single_file(
+                                repo_name, path, fc,
+                                f"fix: clean hardcoded backend bucket (attempt {retry})",
+                                branch=branch,
+                            )
+                    await asyncio.sleep(3)
+                    trigger2 = github_agent.trigger_pipeline(repo_name, "deploy.yml", branch)
+                    if trigger2.get("error"):
+                        last_error = trigger2["error"]
+                        break
+                    await cb(f"Retriggering pipeline (attempt {retry}/{MAX_RETRIES})...")
+                    continue
 
                 # Pass live files directly so Claude sees exactly what's in the repo
                 fix_result = code_agent.analyze_and_fix(
@@ -561,6 +671,7 @@ class Orchestrator:
         user_id:     int,
         project:     str,
         repo_name:   str,
+        branch:      str = "main",
         delete_repo: bool = False,
         progress_cb: Optional[Callable] = None,
     ) -> dict:
@@ -569,6 +680,29 @@ class Orchestrator:
 
         try:
             self._check_stop(user_id)
+
+            deploy_branch = branch
+            await cb(f"Destroying project '{project}' from branch '{deploy_branch}'...")
+
+            # Patch terraform files on that branch with correct bucket before destroying
+            bucket_name = aws_agent.get_state_bucket_name()
+            dep         = state.get_deployment(project) or {}
+            region      = dep.get("region", "us-east-1")
+
+            # Ensure S3 bucket exists in this account
+            aws_agent.ensure_s3_bucket(bucket_name)
+
+            # Patch terraform backend on the deploy branch before triggering destroy
+            branch_files = github_agent.get_existing_files(repo_name, branch=deploy_branch)
+            _patch_terraform_bucket(branch_files, bucket_name, region)
+            for path, fc in branch_files.items():
+                if path.endswith(".tf"):
+                    github_agent.push_single_file(
+                        repo_name, path, fc,
+                        f"fix: update terraform backend for destroy",
+                        branch=deploy_branch,
+                    )
+                    await cb(f"Patched {path} → bucket: {bucket_name}")
 
             # Cancel any running pipelines first
             cancelled = github_agent.cancel_running_pipelines(repo_name)
@@ -579,9 +713,10 @@ class Orchestrator:
             retry = 0
             while retry <= MAX_DESTROY_RETRIES:
                 self._check_stop(user_id)
-                await cb(f"Triggering destroy pipeline... (attempt {retry + 1})")
+                await cb(f"Triggering destroy pipeline on branch '{deploy_branch}'... (attempt {retry + 1})")
 
-                trigger = github_agent.trigger_pipeline(repo_name, "destroy.yml")
+                trigger = github_agent.trigger_pipeline(repo_name, "destroy.yml",
+                                                        branch=deploy_branch)
                 if trigger.get("status") == "error":
                     await cb(f"Trigger failed: {trigger['error']}")
                     break
@@ -620,31 +755,61 @@ class Orchestrator:
                 retry += 1
                 await cb(f"Destroy pipeline failed — fixing (retry {retry}/{MAX_DESTROY_RETRIES})...")
 
-                # Fetch latest files from repo before fixing
-                repo_files_now = github_agent.get_existing_files(repo_name)
+                # Fetch latest files from the DEPLOY branch (not main)
+                repo_files_now = github_agent.get_existing_files(repo_name, branch=deploy_branch)
                 for path, fcontent in repo_files_now.items():
                     state.save_file(project, path, fcontent)
 
+                # S3 403 on destroy = wrong bucket in backend config
+                # Fix by re-patching .tf files and re-pushing to deploy branch
+                combined_log = " ".join(
+                    j.get("log", "") for j in pipeline.get("all_jobs", [])
+                )
+                if ("403" in combined_log or "AccessDenied" in combined_log or "Access Denied" in combined_log) and ("tfstate" in combined_log.lower() or "ListObjects" in combined_log or "HeadObject" in combined_log):
+                    correct_bucket = aws_agent.get_state_bucket_name()
+                    await cb(f"S3 403 detected — updating TF_STATE_BUCKET secret → {correct_bucket}")
+                    # Update secret so pipeline uses correct bucket on retry
+                    github_agent.set_secrets(repo_name, {"TF_STATE_BUCKET": correct_bucket})
+                    # Clean any hardcoded bucket from .tf files
+                    _patch_terraform_bucket(repo_files_now, correct_bucket, region)
+                    for path, fc in repo_files_now.items():
+                        if path.endswith(".tf"):
+                            github_agent.push_single_file(
+                                repo_name, path, fc,
+                                f"fix: correct S3 backend bucket for destroy attempt {retry}",
+                                branch=deploy_branch,
+                            )
+                            await cb(f"Patched {path}")
+                    await asyncio.sleep(3)
+                    continue
+
+                # General AI fix — pass deploy branch so fix goes to right place
                 analysis   = error_agent.analyze(
                     pipeline.get("failed_jobs", []),
                     all_jobs=pipeline.get("all_jobs", []),
                 )
-                fix_result = code_agent.analyze_and_fix(
+                fixes = code_agent.analyze_and_fix(
                     project,
                     analysis.get("log_context", "") or analysis.get("full_log", ""),
                 )
 
-                if "error" in fix_result:
-                    await cb(f"Could not auto-fix: {fix_result['error']}")
+                if "error" in fixes:
+                    await cb(f"Could not auto-fix: {fixes['error']}")
                     break
 
-                await cb(f"Fixed {fix_result['file']}: {fix_result['diff_summary']}")
-                github_agent.push_single_file(
-                    repo_name,
-                    fix_result["file"],
-                    fix_result["fixed_content"],
-                    f"Fix destroy attempt {retry}",
-                )
+                # Push all fixes to deploy branch
+                fixed_files = fixes.get("files") or ([fixes] if fixes.get("file") else [])
+                for fix in fixed_files:
+                    if not fix.get("file"):
+                        continue
+                    await cb(f"Fixed {fix['file']}: {fix.get('diff_summary','')}")
+                    github_agent.push_single_file(
+                        repo_name,
+                        fix["file"],
+                        fix["fixed_content"],
+                        f"fix destroy attempt {retry}",
+                        branch=deploy_branch,
+                    )
                 await asyncio.sleep(3)
 
             state.update_deployment(project, status="destroy_failed")
