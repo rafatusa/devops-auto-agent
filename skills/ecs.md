@@ -16,9 +16,15 @@ provider "aws" {
   region = var.aws_region
 }
 
-variable "aws_region"    { default = "us-east-1" }
+variable "aws_region"    { description = "AWS region" }
+variable "tf_state_bucket" { description = "S3 bucket for terraform state" }
 variable "project_name"  {}
-variable "image_tag"     { default = "latest" }
+# Bootstrap image — used ONLY by Terraform on first apply.
+# The pipeline overwrites this immediately after pushing to ECR.
+# Using a public Docker Hub image avoids chicken-and-egg (ECR empty on first deploy).
+variable "bootstrap_image" { default = "nginx:alpine" }
+variable "task_cpu"      { default = "256" }
+variable "task_memory"   { default = "512" }
 
 # ECR
 resource "aws_ecr_repository" "app" {
@@ -100,12 +106,12 @@ resource "aws_ecs_task_definition" "app" {
   family                   = var.project_name
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
-  cpu                      = "256"
-  memory                   = "512"
+  cpu                      = var.task_cpu
+  memory                   = var.task_memory
   execution_role_arn       = aws_iam_role.ecs_task.arn
   container_definitions = jsonencode([{
     name      = var.project_name
-    image     = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
+    image     = var.bootstrap_image  # pipeline updates this to ECR image after first push
     essential = true
     portMappings = [{ containerPort = 80 protocol = "tcp" }]
     logConfiguration = {
@@ -130,7 +136,7 @@ resource "aws_ecs_service" "app" {
   name            = "${var.project_name}-service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.app.arn
-  desired_count   = 1
+  desired_count   = 0   # pipeline sets to 1 after first image push
   launch_type     = "FARGATE"
   network_configuration {
     subnets          = data.aws_subnets.default.ids
@@ -173,6 +179,8 @@ jobs:
           aws ecs update-service \
             --cluster ${{ secrets.PROJECT_NAME }}-cluster \
             --service ${{ secrets.PROJECT_NAME }}-service \
+            --task-definition "$NEW_ARN" \
+            --desired-count 1 \
             --force-new-deployment
 ```
 
@@ -192,3 +200,45 @@ jobs:
 - ALL terraform code goes in ONE file: `terraform/main.tf`
 - NEVER create separate `outputs.tf`, `variables.tf`, or `providers.tf`
 - Duplicate output names will cause `terraform init` to fail immediately
+
+## CRITICAL: Bootstrap image rule — NEVER use ECR :latest in Terraform
+
+**The chicken-and-egg problem:**
+Terraform creates the ECS task definition on first apply. At that moment, ECR is empty —
+no image has been pushed yet. If the task def points to `ECR_URL:latest`, ECS immediately
+tries to pull it, fails with `CannotPullContainerError: not found`, and the service enters
+a crash loop that looks like a pipeline bug.
+
+**The fix — always use a public Docker Hub image as bootstrap:**
+```hcl
+# CORRECT — bootstrap with public image, pipeline overwrites after first push
+variable "bootstrap_image" { default = "nginx:alpine" }
+
+resource "aws_ecs_task_definition" "app" {
+  container_definitions = jsonencode([{
+    image = var.bootstrap_image   # pipeline updates this via register-task-definition
+  }])
+}
+```
+
+```hcl
+# WRONG — ECR is empty on first Terraform apply, ECS will crash loop
+variable "image_tag" { default = "latest" }
+image = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
+```
+
+**The pipeline then takes over:**
+After `docker push` succeeds, `deploy-ecs` job calls `aws ecs register-task-definition`
+with the real ECR image URI (SHA tag), then `aws ecs update-service` to point to it.
+Terraform never touches the image again after the first apply.
+
+## CRITICAL: ECS service must not desired_count=0 on first apply
+
+Set `desired_count = 0` in Terraform so ECS doesn't try to start tasks before the pipeline
+pushes the real image. The pipeline sets it to 1 via `update-service --desired-count 1`.
+
+```hcl
+resource "aws_ecs_service" "app" {
+  desired_count = 0   # pipeline sets to 1 after first image push
+}
+```

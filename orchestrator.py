@@ -194,6 +194,7 @@ class Orchestrator:
         region:      str = "us-east-1",
         branch:      str = "main",
         target:      str = "ec2",
+        html_mode:   str = "separate",
         progress_cb: Optional[Callable] = None,
     ) -> dict:
         self.resume(user_id)
@@ -205,7 +206,7 @@ class Orchestrator:
             state.log_step(project, name, "running")
 
         try:
-            state.save_deployment(project, app, repo_name, region=region, branch=branch)
+            state.save_deployment(project, app, repo_name, region=region, branch=branch, target=target, html_mode=html_mode)
 
             # ── Check if previously deployed successfully ──────────────────────
             dep = state.get_deployment(project)
@@ -314,6 +315,7 @@ class Orchestrator:
                     project, app, region,
                     existing_files=repo_files,
                     target=target,
+                    html_mode=html_mode,
                 )
 
             state.log_step(project, "generate_files", "done",
@@ -561,6 +563,26 @@ class Orchestrator:
 
             state.log_step(project, "pipeline", "failed")
             state.update_deployment(project, status="failed")
+
+            # ── Force cleanup: remove any AWS resources partially created ────
+            await cb("🧹 Cleaning up partially created AWS resources...")
+            try:
+                dep = state.get_deployment(project)
+                _target = dep.get("target", "ec2") if dep else target
+                cleanup_result = aws_agent.cleanup(project, target=_target)
+                _cleanup_summary = ", ".join(
+                    f"{k}: {list(v.values())[0]}"
+                    for k, v in cleanup_result.items()
+                    if not isinstance(list(v.values())[0], list) or list(v.values())[0]
+                )
+                await cb(f"Cleaned: {_cleanup_summary}")
+                # Also delete GitHub repo to avoid confusion
+                github_agent.cleanup(repo_name, delete_repo=True)
+                await cb("GitHub repo deleted.")
+            except Exception as _ce:
+                logger.warning(f"Force cleanup error: {_ce}")
+                await cb(f"⚠️ Cleanup partial — check AWS console for {project} resources")
+
             return {
                 "status":  "failed",
                 "message": f"Failed after {MAX_RETRIES} attempts. Last error: {last_error}",
@@ -701,6 +723,7 @@ class Orchestrator:
             bucket_name = aws_agent.get_state_bucket_name()
             dep         = state.get_deployment(project) or {}
             region      = dep.get("region", "us-east-1")
+            target      = dep.get("target", "ec2")
 
             # Ensure S3 bucket exists in this account
             aws_agent.ensure_s3_bucket(bucket_name)
@@ -761,9 +784,27 @@ class Orchestrator:
 
                 # Pipeline failed — auto fix and retry
                 if retry >= MAX_DESTROY_RETRIES:
-                    await cb(f"Destroy failed after {MAX_DESTROY_RETRIES} attempts")
-                    await cb(f"Check logs: {pipeline.get('run_url', '')}")
-                    await cb("Use /aws cleanup to remove resources manually")
+                    await cb(f"Destroy pipeline failed after {MAX_DESTROY_RETRIES} attempts — forcing AWS cleanup...")
+                    try:
+                        dep = state.get_deployment(project)
+                        _target = dep.get("target", "ec2") if dep else "ec2"
+                        cleanup_result = aws_agent.cleanup(project, target=_target)
+                        _cleanup_summary = ", ".join(
+                            f"{k}: {list(v.values())[0]}"
+                            for k, v in cleanup_result.items()
+                            if not isinstance(list(v.values())[0], list) or list(v.values())[0]
+                        )
+                        await cb(f"🧹 Cleaned: {_cleanup_summary}")
+                        if delete_repo:
+                            github_agent.cleanup(repo_name, delete_repo=True)
+                            await cb("GitHub repo deleted.")
+                        state.update_deployment(project, status="destroyed")
+                        state.log_step(project, "destroy", "done", result="force_cleanup")
+                        return {"status": "success", "message": f"Force-cleaned {project} after pipeline failure"}
+                    except Exception as _ce:
+                        logger.warning(f"Force destroy cleanup error: {_ce}")
+                        await cb(f"⚠️ Cleanup partial — check AWS console for {project} resources")
+                        await cb(f"Logs: {pipeline.get('run_url', '')}")
                     break
 
                 retry += 1
@@ -810,7 +851,8 @@ class Orchestrator:
                 # ── Undeclared variable intercept ────────────────────────────
                 # If destroy.yml passes -var flags for variables not in main.tf,
                 # terraform destroy fails. Fix: regenerate destroy.yml with no -var flags.
-                if "Value for undeclared variable" in combined_log or                    ("undeclared variable" in combined_log.lower() and "terraform destroy" in combined_log.lower()):
+                if ("Value for undeclared variable" in combined_log or
+                    ("undeclared variable" in combined_log.lower() and "terraform destroy" in combined_log.lower())):
                     await cb("Destroy.yml passing invalid -var flags — regenerating without vars...")
                     new_destroy = code_agent._gen_destroy(project, region, target)
                     github_agent.push_single_file(

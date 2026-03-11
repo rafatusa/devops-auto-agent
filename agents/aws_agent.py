@@ -435,18 +435,185 @@ class AWSAgent:
         except Exception as e:
             return {"error": str(e)}
 
-    def cleanup(self, project: str) -> dict:
-        """Clean up ALL AWS resources for a project."""
-        results = {}
-        results["ec2"] = self.terminate_ec2(project)
 
-        # Wait a moment for EC2 to start terminating before deleting SG
+    # ── ECS cleanup ───────────────────────────────────────────────────────────
+
+    def _ecs(self):
+        return boto3.client("ecs", region_name=self.region)
+
+    def _ecr(self):
+        return boto3.client("ecr", region_name=self.region)
+
+    def _elbv2(self):
+        return boto3.client("elbv2", region_name=self.region)
+
+    def _iam(self):
+        return boto3.client("iam", region_name=self.region)
+
+    def _logs(self):
+        return boto3.client("logs", region_name=self.region)
+
+    def cleanup_ecs(self, project: str) -> dict:
+        """
+        Delete ALL ECS-related resources for a project.
+        Only touches resources tagged/named with the project name.
+        Never modifies resources belonging to other projects.
+        """
         import time
-        if results["ec2"].get("terminated"):
-            time.sleep(5)
+        results = {}
 
-        results["sg"]  = self.delete_security_group(project)
-        results["key"] = self.delete_key_pair(project)
+        # 1. Scale down + delete ECS service
+        try:
+            self._ecs().update_service(
+                cluster=f"{project}-cluster",
+                service=f"{project}-service",
+                desiredCount=0
+            )
+            time.sleep(3)
+            self._ecs().delete_service(
+                cluster=f"{project}-cluster",
+                service=f"{project}-service",
+                force=True
+            )
+            results["ecs_service"] = {"deleted": f"{project}-service"}
+        except self._ecs().exceptions.ServiceNotFoundException:
+            results["ecs_service"] = {"skipped": "not found"}
+        except self._ecs().exceptions.ClusterNotFoundException:
+            results["ecs_service"] = {"skipped": "cluster not found"}
+        except Exception as e:
+            results["ecs_service"] = {"error": str(e)}
+
+        # 2. Deregister all task definitions for this project
+        try:
+            paginator = self._ecs().get_paginator("list_task_definitions")
+            arns = []
+            for page in paginator.paginate(familyPrefix=project):
+                arns.extend(page["taskDefinitionArns"])
+            for arn in arns:
+                self._ecs().deregister_task_definition(taskDefinition=arn)
+            results["task_definitions"] = {"deregistered": len(arns)}
+        except Exception as e:
+            results["task_definitions"] = {"error": str(e)}
+
+        # 3. Delete ECS cluster
+        try:
+            self._ecs().delete_cluster(cluster=f"{project}-cluster")
+            results["ecs_cluster"] = {"deleted": f"{project}-cluster"}
+        except self._ecs().exceptions.ClusterNotFoundException:
+            results["ecs_cluster"] = {"skipped": "not found"}
+        except Exception as e:
+            results["ecs_cluster"] = {"error": str(e)}
+
+        # 4. Delete ECR repository (force deletes all images too)
+        try:
+            self._ecr().delete_repository(repositoryName=project, force=True)
+            results["ecr"] = {"deleted": project}
+        except self._ecr().exceptions.RepositoryNotFoundException:
+            results["ecr"] = {"skipped": "not found"}
+        except Exception as e:
+            results["ecr"] = {"error": str(e)}
+
+        # 5. Delete ALB (must delete before security groups)
+        try:
+            albs = self._elbv2().describe_load_balancers()["LoadBalancers"]
+            project_albs = [a for a in albs if project in a["LoadBalancerName"]]
+            for alb in project_albs:
+                self._elbv2().delete_load_balancer(LoadBalancerArn=alb["LoadBalancerArn"])
+                results["alb"] = {"deleted": alb["LoadBalancerName"]}
+            if not project_albs:
+                results["alb"] = {"skipped": "not found"}
+            # Wait for ALB to fully delete before target groups
+            time.sleep(15)
+        except Exception as e:
+            results["alb"] = {"error": str(e)}
+
+        # 6. Delete target groups
+        try:
+            tgs = self._elbv2().describe_target_groups()["TargetGroups"]
+            project_tgs = [t for t in tgs if project in t["TargetGroupName"]]
+            deleted_tgs = []
+            for tg in project_tgs:
+                try:
+                    self._elbv2().delete_target_group(TargetGroupArn=tg["TargetGroupArn"])
+                    deleted_tgs.append(tg["TargetGroupName"])
+                except Exception:
+                    pass
+            results["target_groups"] = {"deleted": deleted_tgs} if deleted_tgs else {"skipped": "not found"}
+        except Exception as e:
+            results["target_groups"] = {"error": str(e)}
+
+        # 7. Delete security groups (ALB sg + ECS task sg) — only project-named ones
+        try:
+            sgs = self._ec2().describe_security_groups(
+                Filters=[{"Name": "group-name", "Values": [
+                    f"{project}-alb-sg", f"{project}-ecs-sg", f"{project}-sg"
+                ]}]
+            )["SecurityGroups"]
+            deleted_sgs = []
+            for sg in sgs:
+                try:
+                    self._ec2().delete_security_group(GroupId=sg["GroupId"])
+                    deleted_sgs.append(sg["GroupName"])
+                except Exception:
+                    pass
+            results["security_groups"] = {"deleted": deleted_sgs} if deleted_sgs else {"skipped": "not found"}
+        except Exception as e:
+            results["security_groups"] = {"error": str(e)}
+
+        # 8. Delete IAM roles (task role + execution role)
+        deleted_roles = []
+        for role_name in [f"{project}-ecs-task-role", f"{project}-ecs-execution-role",
+                          f"{project}-task-execution-role"]:
+            try:
+                # Detach managed policies
+                attached = self._iam().list_attached_role_policies(RoleName=role_name)
+                for p in attached["AttachedPolicies"]:
+                    self._iam().detach_role_policy(RoleName=role_name, PolicyArn=p["PolicyArn"])
+                # Delete inline policies
+                inline = self._iam().list_role_policies(RoleName=role_name)
+                for p in inline["PolicyNames"]:
+                    self._iam().delete_role_policy(RoleName=role_name, PolicyName=p)
+                self._iam().delete_role(RoleName=role_name)
+                deleted_roles.append(role_name)
+            except self._iam().exceptions.NoSuchEntityException:
+                pass
+            except Exception as e:
+                results[f"iam_{role_name}"] = {"error": str(e)}
+        results["iam_roles"] = {"deleted": deleted_roles}
+
+        # 9. Delete CloudWatch log group
+        try:
+            self._logs().delete_log_group(logGroupName=f"/ecs/{project}")
+            results["log_group"] = {"deleted": f"/ecs/{project}"}
+        except self._logs().exceptions.ResourceNotFoundException:
+            results["log_group"] = {"skipped": "not found"}
+        except Exception as e:
+            results["log_group"] = {"error": str(e)}
+
+        return results
+
+    def cleanup(self, project: str, target: str = "ec2") -> dict:
+        """
+        Clean up ALL AWS resources for a project.
+        Routes to the correct cleaner based on target (ec2 / ec2-docker / ecs).
+        NEVER touches resources that don't match the project name.
+        """
+        import time
+        results = {}
+
+        if target == "ecs":
+            # ECS-specific cleanup
+            ecs_results = self.cleanup_ecs(project)
+            results.update(ecs_results)
+        else:
+            # EC2 / ec2-docker cleanup
+            results["ec2"] = self.terminate_ec2(project)
+            if results["ec2"].get("terminated"):
+                time.sleep(5)
+            results["sg"]  = self.delete_security_group(project)
+            results["key"] = self.delete_key_pair(project)
+
+        # Common to all targets
         results["ssm"] = self.delete_ssm_keys(project)
         results["s3"]  = self.delete_s3_state(project)
         return results

@@ -257,17 +257,6 @@ class CodeAgent:
         return _strip_fences(_ask(prompt))
 
     def _gen_destroy(self, project: str, region: str, target: str = "ec2") -> str:
-        # Only pass -var flags for variables that actually exist in main.tf
-        # ec2/ec2-docker need public_key; ecs does not
-        var_flags = (
-            f"-var=\"public_key=placeholder\" "
-            f"-var=\"project_name=${{{{ secrets.PROJECT_NAME }}}}\" "
-            f"-var=\"aws_region=${{{{ secrets.AWS_REGION }}}}\"" 
-            if target != "ecs"
-            else
-            f"-var=\"project_name=${{{{ secrets.PROJECT_NAME }}}}\" "
-            f"-var=\"aws_region=${{{{ secrets.AWS_REGION }}}}\"" 
-        )
         prompt = (
             f"Generate a GitHub Actions destroy.yml for project \"{project}\".\n"
             f"- workflow_dispatch trigger only (never push)\n"
@@ -276,10 +265,14 @@ class CodeAgent:
             f"  -backend-config=\"bucket=${{{{ secrets.TF_STATE_BUCKET }}}}\"\n"
             f"  -backend-config=\"region=${{{{ secrets.AWS_REGION }}}}\"\n"
             f"  -backend-config=\"key={project}/terraform.tfstate\"\n"
-            f"- terraform destroy step: use ONLY -auto-approve. NO -var flags whatsoever.\n"
-            f"  Reason: terraform destroy reads existing state — it does not need input variables.\n"
-            f"  Passing -var flags for variables not declared in main.tf causes destroy to FAIL.\n"
-            f"  The correct command is exactly: terraform destroy -auto-approve\n"
+            f"- terraform destroy step MUST pass vars that are declared in main.tf:\n"
+            f"  terraform destroy -auto-approve \\\n"
+            f"    -var=\"project_name=${{{{ secrets.PROJECT_NAME }}}}\" \\\n"
+            f"    -var=\"aws_region=${{{{ secrets.AWS_REGION }}}}\"" + (
+            f" \\\n    -var=\"public_key=placeholder\"" if target != "ecs" else "") + "\n"
+            f"  Reason: terraform vars declared in main.tf must be satisfied even during destroy.\n"
+            f"  Only pass vars that are actually declared as variable blocks in main.tf.\n"
+            f"  For ECS: no public_key var. For EC2/ec2-docker: include public_key=placeholder.\n"
             f"- CRITICAL: Do NOT add || true after terraform destroy.\n"
             f"  The pipeline must fail visibly if destroy fails.\n"
             f"  Only || true is acceptable on cleanup steps like: aws ec2 delete-key-pair, aws ec2 delete-security-group\n"

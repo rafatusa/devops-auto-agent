@@ -29,6 +29,7 @@ def init_db():
             cloud       TEXT DEFAULT 'AWS',
             region      TEXT DEFAULT 'us-east-1',
             branch      TEXT DEFAULT 'main',
+            target      TEXT DEFAULT 'ec2',
             status      TEXT DEFAULT 'pending',
             ec2_ip      TEXT,
             created_at  TEXT,
@@ -52,17 +53,23 @@ def init_db():
             UNIQUE(project, path)
         );
         """)
+        # Migration for existing DBs — add target column if missing
+        try:
+            conn.execute("ALTER TABLE deployments ADD COLUMN target TEXT DEFAULT 'ec2'")
+        except Exception:
+            pass  # Column already exists
 
 
-def save_deployment(project, app, repo, cloud="AWS", region="us-east-1", branch="main"):
+def save_deployment(project, app, repo, cloud="AWS", region="us-east-1", branch="main", target="ec2"):
     now = datetime.utcnow().isoformat()
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO deployments (project,app,repo,cloud,region,branch,status,created_at,updated_at) "
-            "VALUES (?,?,?,?,?,?,'pending',?,?) "
+            "INSERT INTO deployments (project,app,repo,cloud,region,branch,target,status,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,'pending',?,?) "
             "ON CONFLICT(project) DO UPDATE SET app=excluded.app, repo=excluded.repo, "
-            "cloud=excluded.cloud, region=excluded.region, branch=excluded.branch, updated_at=excluded.updated_at",
-            (project, app, repo, cloud, region, branch, now, now)
+            "cloud=excluded.cloud, region=excluded.region, branch=excluded.branch, "
+            "target=excluded.target, updated_at=excluded.updated_at",
+            (project, app, repo, cloud, region, branch, target, now, now)
         )
 
 
@@ -108,7 +115,6 @@ def step_done(project, step):
 
 def save_file(project, path, content):
     now = datetime.utcnow().isoformat()
-    # Also write to local filesystem
     local_path = Path(f"/tmp/devops-agent/{project}/{path}")
     local_path.parent.mkdir(parents=True, exist_ok=True)
     local_path.write_text(content)
@@ -121,11 +127,9 @@ def save_file(project, path, content):
 
 
 def get_file(project, path):
-    # Try local filesystem first
     local_path = Path(f"/tmp/devops-agent/{project}/{path}")
     if local_path.exists():
         return local_path.read_text()
-    # Fall back to DB
     with _conn() as conn:
         row = conn.execute(
             "SELECT content FROM files WHERE project=? AND path=?", (project, path)
